@@ -55,6 +55,7 @@ export function EntryView({ entry, mode = "detail", eager = true }: { entry: Ent
   const ref = atlas.byId.get(entry.id);
   const card = useStore((s) => s.progress.cards[entry.id]);
   const saved = useStore((s) => s.progress.bookmarks.includes(entry.id));
+  const writable = useStore((s) => s.writeAccess === "writable");
   const accent = useStore((s) => s.settings.accent);
   const topicIdx = atlas.topics.findIndex((t) => t[0] === entry.topic);
   const topic = atlas.topics[topicIdx];
@@ -80,7 +81,7 @@ export function EntryView({ entry, mode = "detail", eager = true }: { entry: Ent
           </div>
           {mode === "detail" && (
             <div className="entry-actions">
-              <button className={`icon-btn ${saved ? "is-on" : ""}`} onClick={() => toggleBookmark(entry.id)} aria-pressed={saved} aria-label={saved ? "取消收藏" : "收藏"} title={saved ? "取消收藏" : "收藏"}>
+              <button className={`icon-btn ${saved ? "is-on" : ""}`} disabled={!writable} onClick={() => toggleBookmark(entry.id)} aria-pressed={saved} aria-label={saved ? "取消收藏" : "收藏"} title={writable ? (saved ? "取消收藏" : "收藏") : "此窗口只读"}>
                 {saved ? <BookmarkCheck size={19} /> : <Bookmark size={19} />}
               </button>
               <button className="icon-btn" onClick={() => shareWord(atlas, entry)} aria-label="生成分享卡片" title="生成分享卡片">

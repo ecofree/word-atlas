@@ -34,6 +34,7 @@ const CUE_GAIN: Record<Cue, number> = {
 let ctx: AudioContext | null = null;
 let master: GainNode | null = null;
 const buffers = new Map<string, Promise<AudioBuffer | null>>();
+const failedFiles = new Set<string>();
 
 function audio() {
   if (!ctx) {
@@ -43,23 +44,29 @@ function audio() {
     master = ctx.createGain();
     master.connect(ctx.destination);
   }
-  if (ctx.state === "suspended") void ctx.resume();
+  if (ctx.state === "suspended") void ctx.resume().catch(() => null);
   return ctx;
 }
 
 function load(file: string) {
-  let p = buffers.get(file);
-  if (!p) {
-    const c = audio();
-    p = c
-      ? fetch(BASE + file)
-          .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
-          .then((b) => c.decodeAudioData(b))
-          .catch(() => null)
-      : Promise.resolve(null);
-    buffers.set(file, p);
-  }
-  return p;
+  const cached = buffers.get(file);
+  if (cached) return cached;
+  const c = audio();
+  if (!c) return Promise.resolve(null);
+  // A previous 200 response can still contain bad audio. Ask the worker to refresh
+  // that runtime entry on retry, instead of decoding the same cached bytes forever.
+  const pending = fetch(BASE + file, failedFiles.has(file) ? { cache: "reload" } : undefined)
+    .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
+    .then((b) => c.decodeAudioData(b))
+    .catch(() => null);
+  buffers.set(file, pending);
+  // Share in-flight requests, but a temporary offline/decoding failure is retryable.
+  void pending.then((buffer) => {
+    if (buffers.get(file) !== pending) return;
+    if (buffer) failedFiles.delete(file);
+    else { buffers.delete(file); failedFiles.add(file); }
+  });
+  return pending;
 }
 
 /** Warm the cue buffers after the first user gesture so the first answer isn't silent. */
@@ -102,6 +109,7 @@ export async function cue(name: Cue) {
 /* ---------- ambience ---------- */
 
 let amb: { id: AmbienceId; src: AudioBufferSourceNode; gain: GainNode } | null = null;
+let ambienceRequest = 0;
 let ambVolume = 0.5;
 let ducked = false;
 const level = () => ambVolume * (ducked ? 0.35 : 1) * 0.9;
@@ -114,6 +122,7 @@ function fadeTo(g: GainNode, v: number, seconds: number) {
 }
 
 export async function setAmbience(id: AmbienceId | null, volume = ambVolume) {
+  const mine = ++ambienceRequest;
   ambVolume = volume;
   if (amb && amb.id === id) {
     fadeTo(amb.gain, level(), 0.4);
@@ -129,7 +138,7 @@ export async function setAmbience(id: AmbienceId | null, volume = ambVolume) {
   const c = audio();
   if (!c || !master) return;
   const buf = await load(`amb-${id}.mp3`);
-  if (!buf || amb) return;
+  if (!buf || mine !== ambienceRequest) return;
   const src = c.createBufferSource();
   src.buffer = buf;
   src.loop = true;

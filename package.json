@@ -7,12 +7,16 @@
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "test": "node --import tsx --test src/**/*.test.ts",
+    "test": "node --import tsx scripts/test.mjs",
     "check:atlas": "node scripts/check-atlas.mjs",
     "build:atlas": "python3 scripts/atlas/build_atlas.py",
     "render:cards": "node scripts/render-cards.mjs",
     "pack:public": "python3 scripts/package_public.py --out ../开源发布/word-atlas",
-    "format": "prettier --write src vite.config.ts scripts/*.mjs package.json tsconfig.json"
+    "format": "prettier --write src vite.config.ts scripts/*.mjs package.json tsconfig.json",
+    "test:e2e": "node scripts/e2e-regressions.mjs",
+    "test:pipeline": "python3 -m unittest discover -s scripts -p 'test_*.py'",
+    "test:e2e:storage": "node scripts/e2e-storage-failures.mjs",
+    "test:e2e:offline": "node scripts/e2e-offline.mjs"
   },
   "dependencies": {
     "@fontsource-variable/fraunces": "^5.3.0",

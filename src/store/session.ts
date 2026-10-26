@@ -11,8 +11,8 @@ export function dueIds(p: Progress, now = Date.now()) {
     .map(([id]) => id);
 }
 
-export function newToday(p: Progress) {
-  return p.days[dayKey()]?.n ?? 0;
+export function newToday(p: Progress, now = Date.now()) {
+  return p.days[dayKey(new Date(now))]?.n ?? 0;
 }
 
 /** Next unseen words along the learning path, starting at the learner's level. */
@@ -30,9 +30,9 @@ export function nextNew(atlas: Atlas, p: Progress, settings: Settings, count: nu
   return out;
 }
 
-export function todayPlan(atlas: Atlas, p: Progress, s: Settings) {
-  const due = dueIds(p).filter((id) => atlas.byId.has(id));
-  const newLeft = Math.max(0, s.dailyNew - newToday(p));
+export function todayPlan(atlas: Atlas, p: Progress, s: Settings, now = Date.now()) {
+  const due = dueIds(p, now).filter((id) => atlas.byId.has(id));
+  const newLeft = Math.max(0, s.dailyNew - newToday(p, now));
   const fresh = nextNew(atlas, p, s, newLeft);
   return { due, fresh, minutes: Math.max(1, Math.round(due.length * 0.25 + fresh.length * 0.9)) };
 }
@@ -83,9 +83,9 @@ export function distractors(atlas: Atlas, ref: WordRef, kind: QuizKind, seed: nu
   return shuffle([ref.id, ...picks], seed);
 }
 
-export function buildSession(atlas: Atlas, p: Progress, s: Settings, opts?: { ids?: string[]; reviewOnly?: boolean }): ActiveSession {
-  const seed = Date.now();
-  const plan = todayPlan(atlas, p, s);
+export function buildSession(atlas: Atlas, p: Progress, s: Settings, opts?: { ids?: string[]; reviewOnly?: boolean }, now = Date.now()): ActiveSession {
+  const seed = now;
+  const plan = todayPlan(atlas, p, s, now);
   const reviewIds = opts?.ids ? opts.ids.filter((id) => p.cards[id]) : plan.due.slice(0, 120);
   const newIds = opts?.ids ? opts.ids.filter((id) => !p.cards[id]) : opts?.reviewOnly ? [] : plan.fresh;
   const steps: Step[] = [];

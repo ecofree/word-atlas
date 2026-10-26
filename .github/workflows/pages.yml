@@ -1,0 +1,75 @@
+name: Deploy to GitHub Pages
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Read Pages configuration
+        id: pages
+        uses: actions/configure-pages@v6
+      - run: npm ci
+      - run: npm test
+      - run: npm run test:pipeline
+      - name: Validate complete atlas and media
+        run: npm run check:atlas
+      - name: Typecheck and build the configured Pages path
+        env:
+          ATLAS_BASE: ${{ steps.pages.outputs.base_path }}/
+        run: npm run build
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e -- --output output/e2e-regressions.json
+      - run: npm run test:e2e:storage -- --output output/e2e-storage-failures.json
+      - run: npm run test:e2e:offline -- --output output/e2e-offline.json
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pages-browser-regressions
+          path: output/e2e-*.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Upload verified static site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy the verified artifact
+        id: deployment
+        uses: actions/deploy-pages@v5

@@ -62,8 +62,7 @@ export default function App() {
   useEffect(() => {
     const next = dataset === "private" && priv ? priv : open;
     if (next && next !== atlas) {
-      store.useDataset(next.id);
-      setAtlas(next);
+      if (store.useDataset(next.id)) setAtlas(next);
     }
   }, [dataset, open, priv, atlas]);
 
@@ -92,9 +91,12 @@ export default function App() {
 }
 
 function Shell({ privateAvailable }: { privateAvailable: boolean }) {
+  const datasetId = useAtlas().id;
   const { route, word } = useLocation();
   const onboarded = useStore((s) => s.settings.onboarded);
   const theme = useStore((s) => s.settings.theme);
+  const writeAccess = useStore((s) => s.writeAccess);
+  const saveError = useStore((s) => s.saveError);
   const [palette, setPalette] = useState(false);
   const [splash, setSplash] = useState(shouldShowSplash);
   const focus = route.page === "learn";
@@ -152,11 +154,24 @@ function Shell({ privateAvailable }: { privateAvailable: boolean }) {
         </header>
       )}
 
+      {writeAccess !== "writable" && (
+        <aside className="write-notice" role="status">
+          <span>{writeAccess === "loading" ? "正在准备学习进度…" : writeAccess === "readonly" ? "此窗口暂时只读。关闭或切离原学习窗口后，会自动恢复编辑。" : writeAccess === "conflict" ? "另一窗口已有更新，本窗口未保存的内容仍保留。请先导出本窗口备份，再刷新并选择要恢复的记录。" : "无法安全保存学习进度。请使用支持 Web Locks 的浏览器，通过 HTTPS 或 localhost 打开；已有进度仍可到「我的」导出。"}</span>
+          <a className="btn btn-ghost" href="#/me">导出备份</a>
+          {(route.page === "learn" || route.page === "practice") && <a className="btn btn-ghost" href="#/">返回今日</a>}
+          {writeAccess !== "loading" && writeAccess !== "conflict" && <button className="btn btn-ghost" onClick={() => store.retryWriter()}>重试</button>}
+        </aside>
+      )}
+      {saveError && <aside className="write-notice" role="alert"><span>有进度或设置尚未保存，请到「我的」导出备份。</span><button className="btn btn-ghost" onClick={() => store.retryWriter()}>重试保存</button></aside>}
       <main className="main" id="main">
         {route.page === "today" && <Today />}
         {route.page === "atlas" && <AtlasPage route={route} />}
-        {route.page === "learn" && <Learn />}
-        {route.page === "practice" && <Practice />}
+        {(route.page === "learn" || route.page === "practice") && (
+          <div key={datasetId} className="learning-surface" inert={writeAccess !== "writable"} aria-disabled={writeAccess !== "writable"}>
+            {route.page === "learn" && <Learn />}
+            {route.page === "practice" && <Practice />}
+          </div>
+        )}
         {route.page === "me" && <Me privateAvailable={privateAvailable} />}
         {route.page === "about" && <About />}
       </main>

@@ -6,7 +6,8 @@ import { play, stopAudio } from "../lib/audio";
 import { burst } from "../lib/burst";
 import { cue } from "../lib/sound";
 import { go } from "../lib/router";
-import { gap, normalize } from "../lib/text";
+import { handlePageShortcut } from "../lib/shortcuts";
+import { acceptedForms, acceptsAnswer, gap, normalize, preferredForm } from "../lib/text";
 import { answer, advance, buildSession, gradeFor, sessionStats } from "../store/session";
 import { Rating } from "../store/srs";
 import { store, useStore, type ActiveSession, type QuizKind, type Step } from "../store/store";
@@ -21,9 +22,10 @@ import { shareSession } from "../ui/shareSession";
 export function Learn() {
   const atlas = useAtlas();
   const session = useStore((s) => s.progress.session);
-  const [ready, setReady] = useState(false);
+  const writable = useStore((s) => s.writeAccess === "writable");
 
   useEffect(() => {
+    if (!writable) return;
     const { progress, settings } = store.get();
     if (!progress.session) {
       const s = buildSession(atlas, progress, settings);
@@ -33,23 +35,18 @@ export function Learn() {
       }
       store.progress((p) => ({ ...p, session: s }));
     }
-  }, [atlas]);
+  }, [atlas, writable]);
 
   const ids = useMemo(() => [...new Set(session?.steps.map((s) => s.id) ?? [])], [session?.id]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!ids.length) return;
-    let live = true;
-    // Load the first chunk before rendering, the rest in the background.
-    prefetch(atlas, ids.slice(0, 6)).then(() => live && setReady(true));
+    // Prefetch is optional; the current step owns its loading, error and retry states.
     void prefetch(atlas, ids);
-    return () => {
-      live = false;
-    };
   }, [atlas, ids]);
 
   useEffect(() => () => stopAudio(), []);
 
-  if (!session || !ready) return <div className="learn learn-loading"><span className="spinner" /></div>;
+  if (!session) return <div className="learn learn-loading"><span className="spinner" /></div>;
   if (session.finished || session.index >= session.steps.length) return <Summary session={session} />;
   return <Runner session={session} />;
 }
@@ -83,26 +80,48 @@ function Runner({ session }: { session: ActiveSession }) {
   );
 }
 
-function useStepTimer() {
-  const t = useRef(performance.now());
-  return () => (performance.now() - t.current) / 1000;
+function useStepTimer(ready: boolean) {
+  const elapsed = useRef(0);
+  const started = useRef<number | null>(ready ? performance.now() : null);
+  useEffect(() => {
+    if (ready) started.current = performance.now();
+    return () => {
+      if (started.current !== null) elapsed.current += performance.now() - started.current;
+      started.current = null;
+    };
+  }, [ready]);
+  return () => (elapsed.current + (started.current === null ? 0 : performance.now() - started.current)) / 1000;
+}
+
+function EntryLoadState({ error, retry }: { error: string | null; retry: () => void }) {
+  if (!error) return <div role="status" aria-label="正在加载词条"><span className="spinner" /></div>;
+  return (
+    <section className="panel" role="alert">
+      <h2>这个词暂时加载不了</h2>
+      <p>请检查网络后重试，当前学习进度会保留。</p>
+      <p className="muted">{error}</p>
+      <button className="btn btn-primary" onClick={retry}>重新加载</button>
+    </section>
+  );
 }
 
 function Intro({ step }: { step: Step }) {
   const atlas = useAtlas();
-  const { entry } = useEntry(step.id);
+  const { entry, error, retry } = useEntry(step.id);
   const settings = useStore((s) => s.settings);
-  const elapsed = useStepTimer();
+  const writable = useStore((s) => s.writeAccess === "writable");
+  const elapsed = useStepTimer(!!entry && writable);
   useEffect(() => {
-    if (entry && settings.autoplay) void play(atlas.audio(entry, settings.accent), entry.w, settings.accent);
-  }, [entry, atlas, settings.autoplay, settings.accent]);
+    if (entry && writable && settings.autoplay) void play(atlas.audio(entry, settings.accent), entry.w, settings.accent);
+  }, [entry, atlas, settings.autoplay, settings.accent, writable]);
   const next = useCallback(() => {
+    if (!entry || store.get().writeAccess !== "writable") return;
     stopAudio();
     if (store.get().settings.sfx) void cue("flip");
     advance(elapsed());
-  }, [elapsed]);
-  useKeys({ Enter: next, " ": next });
-  if (!entry) return <span className="spinner" />;
+  }, [entry, elapsed]);
+  useKeys(entry ? { Enter: next, " ": next } : {});
+  if (!entry) return <EntryLoadState error={error} retry={retry} />;
   return (
     <div className="intro">
       <p className="stage-label">
@@ -131,16 +150,16 @@ const KIND_LABEL: Record<QuizKind, string> = {
 function Quiz({ step, session }: { step: Step & { kind: QuizKind }; session: ActiveSession }) {
   const atlas = useAtlas();
   const ref = atlas.byId.get(step.id)!;
-  const { entry } = useEntry(step.id);
+  const { entry, error, retry } = useEntry(step.id);
   const settings = useStore((s) => s.settings);
+  const writable = useStore((s) => s.writeAccess === "writable");
   const pending = session.pending;
-  const elapsed = useStepTimer();
-  const [hints, setHints] = useState(0);
+  const elapsed = useStepTimer(!!entry && writable);
   const options = useMemo(() => (step.options ?? []).map((id) => atlas.byId.get(id)!).filter(Boolean), [atlas, step.options]);
 
   const submit = useCallback(
-    (value: string, correct: boolean) => {
-      if (pending) return;
+    (value: string, correct: boolean, hinted = false) => {
+      if (!entry || pending || store.get().writeAccess !== "writable") return;
       const ms = elapsed() * 1000;
       if (correct) {
         const el = document.querySelector<HTMLElement>(step.kind === "spell" ? ".slots" : `[data-option="${value}"]`);
@@ -148,20 +167,21 @@ function Quiz({ step, session }: { step: Step & { kind: QuizKind }; session: Act
         if (r) burst(r.left + r.width / 2, r.top + r.height / 2);
       }
       if (settings.sfx) void cue(correct ? "correct" : "wrong");
-      answer(atlas, step, correct, gradeFor(step.kind, correct, ms, hints > 0), value);
+      answer(atlas, step, correct, gradeFor(step.kind, correct, ms, hinted), value);
       if (entry) void play(atlas.audio(entry, settings.accent), entry.w, settings.accent);
     },
-    [pending, elapsed, settings, atlas, step, hints, entry],
+    [pending, elapsed, settings, atlas, step, entry],
   );
 
   const next = useCallback(() => {
+    if (!entry || store.get().writeAccess !== "writable") return;
     stopAudio();
     advance(elapsed());
-  }, [elapsed]);
+  }, [entry, elapsed]);
 
   useEffect(() => {
-    if (step.kind === "listen" && entry && !pending) void play(atlas.audio(entry, settings.accent), entry.w, settings.accent);
-  }, [step.kind, entry, atlas, settings.accent, pending]);
+    if (step.kind === "listen" && entry && !pending && writable) void play(atlas.audio(entry, settings.accent), entry.w, settings.accent);
+  }, [step.kind, entry, atlas, settings.accent, pending, writable]);
 
   const keys: Record<string, () => void> = {};
   if (pending) {
@@ -170,9 +190,9 @@ function Quiz({ step, session }: { step: Step & { kind: QuizKind }; session: Act
   } else if (step.kind !== "spell") {
     options.forEach((o, i) => (keys[String(i + 1)] = () => submit(o.id, o.id === ref.id)));
   }
-  useKeys(keys);
+  useKeys(entry ? keys : {});
 
-  if (!entry) return <span className="spinner" />;
+  if (!entry) return <EntryLoadState error={error} retry={retry} />;
   const sentence = entry.ex[0] ? gap(entry.ex[0].en, entry.w) : null;
 
   return (
@@ -220,11 +240,11 @@ function Quiz({ step, session }: { step: Step & { kind: QuizKind }; session: Act
             </button>
           </div>
         )}
-        {step.kind === "spell" && <SpellPrompt entry={entry} refw={ref} hints={hints} />}
+        {step.kind === "spell" && <SpellPrompt entry={entry} refw={ref} />}
       </section>
 
       {step.kind === "spell" ? (
-        <SpellInput entry={entry} pending={pending} hints={hints} onHint={() => setHints((h) => Math.min(entry.w.length - 1, h + 1))} onSubmit={(v) => submit(v, normalize(v) === normalize(entry.w))} />
+        <SpellInput entry={entry} pending={pending} onSubmit={(v, hinted) => submit(v, acceptsAnswer(v, entry.w), hinted)} />
       ) : (
         <ul className={`options ${step.kind === "meaning" ? "options-zh" : "options-en"}`}>
           {options.map((o, i) => {
@@ -250,11 +270,10 @@ function Quiz({ step, session }: { step: Step & { kind: QuizKind }; session: Act
   );
 }
 
-function SpellPrompt({ entry, refw, hints }: { entry: Entry; refw: WordRef; hints: number }) {
+function SpellPrompt({ entry, refw }: { entry: Entry; refw: WordRef }) {
   const atlas = useAtlas();
   const accent = useStore((s) => s.settings.accent);
   const sentence = entry.ex[0] ? gap(entry.ex[0].en, entry.w) : null;
-  void hints;
   return (
     <div className="prompt-spell">
       <Illustration src={atlas.img(entry)} word={entry.w} topic={refw.topic} eager className="spell-art" />
@@ -275,30 +294,50 @@ function SpellPrompt({ entry, refw, hints }: { entry: Entry; refw: WordRef; hint
   );
 }
 
-function SpellInput({ entry, pending, hints, onHint, onSubmit }: { entry: Entry; pending?: { correct: boolean; value: string }; hints: number; onHint: () => void; onSubmit: (v: string) => void }) {
-  const [value, setValue] = useState("");
+function SpellInput({ entry, pending, onSubmit }: { entry: Entry; pending?: { correct: boolean; value: string }; onSubmit: (v: string, hinted: boolean) => void }) {
+  const [draft, setDraft] = useState({ value: "", hints: 0 });
+  // Keep event handlers on the same answer/hint snapshot, including a hint and
+  // submit dispatched before React commits the updated input.
+  const latest = useRef(draft);
+  const update = (next: typeof draft) => {
+    latest.current = next;
+    setDraft(next);
+  };
+  const { value, hints } = draft;
   const input = useRef<HTMLInputElement>(null);
-  const target = entry.w;
-  const prefix = target.slice(0, hints);
-  useEffect(() => {
-    if (hints && !normalize(value).startsWith(normalize(prefix))) setValue(prefix);
+  const alternatives = acceptedForms(entry.w);
+  const target = preferredForm(entry.w);
+  const targetLength = Array.from(target).length;
+  const hint = () => {
+    if (pending) return;
+    const current = latest.current;
+    const nextHints = Math.min(Math.max(0, targetLength - 1), current.hints + 1);
+    const prefix = Array.from(target).slice(0, nextHints).join("");
+    update({
+      hints: nextHints,
+      value: normalize(current.value).startsWith(normalize(prefix)) ? current.value : prefix,
+    });
     input.current?.focus();
-  }, [hints]); // eslint-disable-line react-hooks/exhaustive-deps
+  };
   const shown = pending ? pending.value : value;
+  // A valid alternative can have another length: show its own correct slots after submission.
+  const slotTarget = pending?.correct ? alternatives.find((form) => normalize(form) === normalize(shown)) ?? target : target;
+  const typedCharacters = Array.from(normalize(shown));
   return (
     <form
       className="spell"
       onSubmit={(e) => {
         e.preventDefault();
-        if (!pending && value.trim()) onSubmit(value);
+        const current = latest.current;
+        if (!pending && current.value.trim()) onSubmit(current.value, current.hints > 0);
       }}
     >
       <div className="slots" aria-hidden="true" onClick={() => input.current?.focus()}>
-        {Array.from(target).map((ch, i) => {
-          const typed = shown[i];
-          const ok = typed !== undefined && typed.toLowerCase() === ch.toLowerCase();
+        {Array.from(slotTarget).map((ch, i) => {
+          const typed = typedCharacters[i];
+          const ok = typed !== undefined && normalize(typed) === normalize(ch);
           return (
-            <span key={i} className={`slot ${ch === " " ? "slot-space" : ""} ${typed !== undefined ? (pending ? (ok ? "is-ok" : "is-bad") : "is-filled") : ""} ${!pending && i === shown.length ? "is-caret" : ""}`}>
+            <span key={i} className={`slot ${ch === " " ? "slot-space" : ""} ${typed !== undefined ? (pending ? (ok ? "is-ok" : "is-bad") : "is-filled") : ""} ${!pending && i === typedCharacters.length ? "is-caret" : ""}`}>
               {pending && !pending.correct ? ch : typed ?? ""}
             </span>
           );
@@ -308,19 +347,19 @@ function SpellInput({ entry, pending, hints, onHint, onSubmit }: { entry: Entry;
         ref={input}
         className="spell-input"
         value={shown}
-        onChange={(e) => !pending && setValue(e.target.value.slice(0, target.length + 6))}
+        onChange={(e) => !pending && update({ ...latest.current, value: e.target.value.slice(0, Math.max(target.length, ...alternatives.map((form) => form.length)) + 6) })}
         autoFocus
         autoCapitalize="off"
         autoCorrect="off"
         autoComplete="off"
         spellCheck={false}
         enterKeyHint="done"
-        aria-label={`拼写，${target.length} 个字符`}
+        aria-label={`拼写，提示词形 ${targetLength} 个字符`}
         readOnly={!!pending}
       />
       {!pending && (
         <div className="spell-actions">
-          <button type="button" className="btn btn-ghost" onClick={onHint} disabled={hints >= target.length - 1}>
+          <button type="button" className="btn btn-ghost" onClick={hint} disabled={hints >= targetLength - 1}>
             <Lightbulb size={17} /> 提示字母
           </button>
           <button type="submit" className="btn btn-primary" disabled={!value.trim()}>
@@ -448,18 +487,7 @@ export function useKeys(map: Record<string, () => void>) {
   const ref = useRef(map);
   ref.current = map;
   useEffect(() => {
-    const on = (e: KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
-      const t = e.target as HTMLElement;
-      const typing = t.tagName === "INPUT" || t.tagName === "TEXTAREA";
-      if (typing && !(e.key === "Enter" && (t as HTMLInputElement).readOnly)) return;
-      if (t.tagName === "BUTTON" && (e.key === "Enter" || e.key === " ")) return;
-      const fn = ref.current[e.key];
-      if (fn) {
-        e.preventDefault();
-        fn();
-      }
-    };
+    const on = (e: KeyboardEvent) => handlePageShortcut(e, ref.current);
     window.addEventListener("keydown", on);
     return () => window.removeEventListener("keydown", on);
   }, []);

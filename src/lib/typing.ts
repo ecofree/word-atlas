@@ -56,6 +56,8 @@ export function typingMetrics(
   const duration = finiteNonnegative(elapsedMs);
   return {
     accuracy: attempted ? Math.round((correct / attempted) * 100) : 100,
-    wpm: duration >= 1000 ? Math.round(accepted / 5 / (duration / 60000)) : 0,
+    // Keep the displayed result inside the persisted TypingRound contract, even
+    // when a paste or IME commit enters a long sentence in one event.
+    wpm: duration >= 1000 ? Math.min(400, Math.round(accepted / 5 / (duration / 60000))) : 0,
   };
 }

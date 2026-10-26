@@ -1,5 +1,5 @@
 import { Crosshair, Minus, Plus, RotateCcw, Share2 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useAtlas } from "../atlas/context";
 import type { WordRef } from "../atlas/types";
 import { openWord } from "../lib/router";
@@ -64,6 +64,15 @@ export function Galaxy({
   const [hover, setHover] = useState<{ ref: WordRef; x: number; y: number } | null>(null);
   const [fallback, setFallback] = useState(false);
   const highlightSet = useMemo(() => new Set(highlight ?? []), [highlight]);
+  const pendingOpen = useRef(0);
+  const cancelOpen = useCallback(() => {
+    window.clearTimeout(pendingOpen.current);
+    pendingOpen.current = 0;
+  }, []);
+  useLayoutEffect(() => {
+    setHover(null);
+    return cancelOpen;
+  }, [layout, mode, cancelOpen]);
 
   useEffect(() => {
     const cv = canvas.current;
@@ -172,7 +181,11 @@ export function Galaxy({
   const pointers = useRef(new Map<number, { x: number; y: number }>());
   const lastTwinkle = useRef(0);
   const dwell = useRef(0);
-  useEffect(() => () => window.clearTimeout(dwell.current), []);
+  useLayoutEffect(() => () => {
+    window.clearTimeout(dwell.current);
+    drag.current = null;
+    pointers.current.clear();
+  }, [layout, mode]);
 
   const local = (e: { clientX: number; clientY: number }) => {
     const r = canvas.current!.getBoundingClientRect();
@@ -226,6 +239,7 @@ export function Galaxy({
   };
 
   const onDown = (e: React.PointerEvent) => {
+    cancelOpen();
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
     pointers.current.set(e.pointerId, local(e));
     drag.current = { ...local(e), moved: 0 };
@@ -251,7 +265,17 @@ export function Galaxy({
     }
     eng.flyTo(i);
     if (store.get().settings.sfx) void cue("fly");
-    window.setTimeout(() => openWord(ref.id), 350);
+    cancelOpen();
+    pendingOpen.current = window.setTimeout(() => {
+      pendingOpen.current = 0;
+      if (engine.current === eng) openWord(ref.id);
+    }, 350);
+  };
+
+  const onCancel = (e: React.PointerEvent) => {
+    pointers.current.delete(e.pointerId);
+    drag.current = null;
+    cancelOpen();
   };
 
   const onWheel = (e: React.WheelEvent) => {
@@ -286,8 +310,9 @@ export function Galaxy({
         onPointerMove={onMove}
         onPointerDown={onDown}
         onPointerUp={onUp}
-        onPointerCancel={onUp}
+        onPointerCancel={onCancel}
         onPointerLeave={() => {
+          window.clearTimeout(dwell.current);
           if (engine.current) engine.current.hover = -1;
           setHover(null);
         }}
@@ -317,7 +342,7 @@ export function Galaxy({
         <button
           className="galaxy-tip"
           style={{ transform: `translate(${Math.min(hover.x + 18, (canvas.current?.clientWidth ?? 0) - 260)}px, ${Math.max(8, hover.y - 46)}px)` }}
-          onClick={() => openWord(hover.ref.id)}
+          onClick={() => { cancelOpen(); openWord(hover.ref.id); }}
         >
           <Illustration src={atlas.img(hover.ref, "thumb")} word={hover.ref.word} topic={hover.ref.topic} />
           <span>
