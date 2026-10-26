@@ -6,6 +6,7 @@ import { play, stopAudio } from "../lib/audio";
 import { burst } from "../lib/burst";
 import { cue } from "../lib/sound";
 import { go } from "../lib/router";
+import { handlePageShortcut } from "../lib/shortcuts";
 import { gap, normalize } from "../lib/text";
 import { answer, advance, buildSession, gradeFor, sessionStats } from "../store/session";
 import { Rating } from "../store/srs";
@@ -21,9 +22,10 @@ import { shareSession } from "../ui/shareSession";
 export function Learn() {
   const atlas = useAtlas();
   const session = useStore((s) => s.progress.session);
-  const [ready, setReady] = useState(false);
+  const writable = useStore((s) => s.writeAccess === "writable");
 
   useEffect(() => {
+    if (!writable) return;
     const { progress, settings } = store.get();
     if (!progress.session) {
       const s = buildSession(atlas, progress, settings);
@@ -33,23 +35,18 @@ export function Learn() {
       }
       store.progress((p) => ({ ...p, session: s }));
     }
-  }, [atlas]);
+  }, [atlas, writable]);
 
   const ids = useMemo(() => [...new Set(session?.steps.map((s) => s.id) ?? [])], [session?.id]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!ids.length) return;
-    let live = true;
-    // Load the first chunk before rendering, the rest in the background.
-    prefetch(atlas, ids.slice(0, 6)).then(() => live && setReady(true));
+    // Prefetch is optional; the current step owns its loading, error and retry states.
     void prefetch(atlas, ids);
-    return () => {
-      live = false;
-    };
   }, [atlas, ids]);
 
   useEffect(() => () => stopAudio(), []);
 
-  if (!session || !ready) return <div className="learn learn-loading"><span className="spinner" /></div>;
+  if (!session) return <div className="learn learn-loading"><span className="spinner" /></div>;
   if (session.finished || session.index >= session.steps.length) return <Summary session={session} />;
   return <Runner session={session} />;
 }
@@ -83,26 +80,48 @@ function Runner({ session }: { session: ActiveSession }) {
   );
 }
 
-function useStepTimer() {
-  const t = useRef(performance.now());
-  return () => (performance.now() - t.current) / 1000;
+function useStepTimer(ready: boolean) {
+  const elapsed = useRef(0);
+  const started = useRef<number | null>(ready ? performance.now() : null);
+  useEffect(() => {
+    if (ready) started.current = performance.now();
+    return () => {
+      if (started.current !== null) elapsed.current += performance.now() - started.current;
+      started.current = null;
+    };
+  }, [ready]);
+  return () => (elapsed.current + (started.current === null ? 0 : performance.now() - started.current)) / 1000;
+}
+
+function EntryLoadState({ error, retry }: { error: string | null; retry: () => void }) {
+  if (!error) return <div role="status" aria-label="正在加载词条"><span className="spinner" /></div>;
+  return (
+    <section className="panel" role="alert">
+      <h2>这个词暂时加载不了</h2>
+      <p>请检查网络后重试，当前学习进度会保留。</p>
+      <p className="muted">{error}</p>
+      <button className="btn btn-primary" onClick={retry}>重新加载</button>
+    </section>
+  );
 }
 
 function Intro({ step }: { step: Step }) {
   const atlas = useAtlas();
-  const { entry } = useEntry(step.id);
+  const { entry, error, retry } = useEntry(step.id);
   const settings = useStore((s) => s.settings);
-  const elapsed = useStepTimer();
+  const writable = useStore((s) => s.writeAccess === "writable");
+  const elapsed = useStepTimer(!!entry && writable);
   useEffect(() => {
-    if (entry && settings.autoplay) void play(atlas.audio(entry, settings.accent), entry.w, settings.accent);
-  }, [entry, atlas, settings.autoplay, settings.accent]);
+    if (entry && writable && settings.autoplay) void play(atlas.audio(entry, settings.accent), entry.w, settings.accent);
+  }, [entry, atlas, settings.autoplay, settings.accent, writable]);
   const next = useCallback(() => {
+    if (!entry || store.get().writeAccess !== "writable") return;
     stopAudio();
     if (store.get().settings.sfx) void cue("flip");
     advance(elapsed());
-  }, [elapsed]);
-  useKeys({ Enter: next, " ": next });
-  if (!entry) return <span className="spinner" />;
+  }, [entry, elapsed]);
+  useKeys(entry ? { Enter: next, " ": next } : {});
+  if (!entry) return <EntryLoadState error={error} retry={retry} />;
   return (
     <div className="intro">
       <p className="stage-label">
@@ -131,16 +150,17 @@ const KIND_LABEL: Record<QuizKind, string> = {
 function Quiz({ step, session }: { step: Step & { kind: QuizKind }; session: ActiveSession }) {
   const atlas = useAtlas();
   const ref = atlas.byId.get(step.id)!;
-  const { entry } = useEntry(step.id);
+  const { entry, error, retry } = useEntry(step.id);
   const settings = useStore((s) => s.settings);
+  const writable = useStore((s) => s.writeAccess === "writable");
   const pending = session.pending;
-  const elapsed = useStepTimer();
+  const elapsed = useStepTimer(!!entry && writable);
   const [hints, setHints] = useState(0);
   const options = useMemo(() => (step.options ?? []).map((id) => atlas.byId.get(id)!).filter(Boolean), [atlas, step.options]);
 
   const submit = useCallback(
     (value: string, correct: boolean) => {
-      if (pending) return;
+      if (!entry || pending || store.get().writeAccess !== "writable") return;
       const ms = elapsed() * 1000;
       if (correct) {
         const el = document.querySelector<HTMLElement>(step.kind === "spell" ? ".slots" : `[data-option="${value}"]`);
@@ -155,13 +175,14 @@ function Quiz({ step, session }: { step: Step & { kind: QuizKind }; session: Act
   );
 
   const next = useCallback(() => {
+    if (!entry || store.get().writeAccess !== "writable") return;
     stopAudio();
     advance(elapsed());
-  }, [elapsed]);
+  }, [entry, elapsed]);
 
   useEffect(() => {
-    if (step.kind === "listen" && entry && !pending) void play(atlas.audio(entry, settings.accent), entry.w, settings.accent);
-  }, [step.kind, entry, atlas, settings.accent, pending]);
+    if (step.kind === "listen" && entry && !pending && writable) void play(atlas.audio(entry, settings.accent), entry.w, settings.accent);
+  }, [step.kind, entry, atlas, settings.accent, pending, writable]);
 
   const keys: Record<string, () => void> = {};
   if (pending) {
@@ -170,9 +191,9 @@ function Quiz({ step, session }: { step: Step & { kind: QuizKind }; session: Act
   } else if (step.kind !== "spell") {
     options.forEach((o, i) => (keys[String(i + 1)] = () => submit(o.id, o.id === ref.id)));
   }
-  useKeys(keys);
+  useKeys(entry ? keys : {});
 
-  if (!entry) return <span className="spinner" />;
+  if (!entry) return <EntryLoadState error={error} retry={retry} />;
   const sentence = entry.ex[0] ? gap(entry.ex[0].en, entry.w) : null;
 
   return (
@@ -448,18 +469,7 @@ export function useKeys(map: Record<string, () => void>) {
   const ref = useRef(map);
   ref.current = map;
   useEffect(() => {
-    const on = (e: KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
-      const t = e.target as HTMLElement;
-      const typing = t.tagName === "INPUT" || t.tagName === "TEXTAREA";
-      if (typing && !(e.key === "Enter" && (t as HTMLInputElement).readOnly)) return;
-      if (t.tagName === "BUTTON" && (e.key === "Enter" || e.key === " ")) return;
-      const fn = ref.current[e.key];
-      if (fn) {
-        e.preventDefault();
-        fn();
-      }
-    };
+    const on = (e: KeyboardEvent) => handlePageShortcut(e, ref.current);
     window.addEventListener("keydown", on);
     return () => window.removeEventListener("keydown", on);
   }, []);

@@ -4120,3 +4120,15 @@ a:hover .mark-needle,
 .streak-panel .mini-stats div:first-child dd {
   color: var(--ochre);
 }
+/* Progress ownership is visible without blocking read-only dictionary browsing. */
+.write-notice {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  padding: .65rem 1rem;
+  font-size: .9rem;
+  background: #fff1d5;
+  color: #62461a;
+}
+.write-notice .btn { color: inherit; }

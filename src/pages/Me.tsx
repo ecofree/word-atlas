@@ -2,7 +2,7 @@ import { Download, RotateCcw, Upload } from "lucide-react";
 import { useMemo, useRef } from "react";
 import { useAtlas } from "../atlas/context";
 import { isMastered } from "../store/srs";
-import { dayKey, exportBackup, importBackup, resetProgress, store, useStore, type Settings } from "../store/store";
+import { dayKey, exportBackup, exportRecoveryBackup, importBackup, resetProgress, store, useStore, type Settings } from "../store/store";
 import { toast } from "../ui/Toast";
 import { streakOf } from "./Today";
 
@@ -11,6 +11,7 @@ export function Me({ privateAvailable }: { privateAvailable: boolean }) {
   const progress = useStore((s) => s.progress);
   const settings = useStore((s) => s.settings);
   const saveError = useStore((s) => s.saveError);
+  const writable = useStore((s) => s.writeAccess === "writable");
   const file = useRef<HTMLInputElement>(null);
 
   const stats = useMemo(() => {
@@ -33,11 +34,11 @@ export function Me({ privateAvailable }: { privateAvailable: boolean }) {
   }, [progress]);
 
   const set = (patch: Partial<Settings>) => store.settings(patch);
-  const download = () => {
-    const blob = new Blob([exportBackup()], { type: "application/json" });
+  const download = (text = exportBackup(), suffix = "backup") => {
+    const blob = new Blob([text], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `word-atlas-backup-${dayKey()}.json`;
+    a.download = `word-atlas-${suffix}-${dayKey()}.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   };
@@ -184,19 +185,22 @@ export function Me({ privateAvailable }: { privateAvailable: boolean }) {
           <p className="muted">进度只存在这台设备的浏览器里：没有账号，没有服务器。换设备时，导出备份再导入即可。</p>
           {saveError && <p className="warn-text">浏览器拒绝保存（可能是隐私模式或空间已满）。请尽快导出备份。</p>}
           <div className="data-actions">
-            <button className="btn btn-ghost" onClick={download}>
+            <button className="btn btn-ghost" onClick={() => download()}>
               <Download size={18} /> 导出备份
             </button>
-            <button className="btn btn-ghost" onClick={() => file.current?.click()}>
+            <button className="btn btn-ghost" disabled={!writable} onClick={() => file.current?.click()}>
               <Upload size={18} /> 导入备份
             </button>
+            {exportRecoveryBackup() && <button className="btn btn-ghost" onClick={() => download(exportRecoveryBackup()!, "before-import")}>
+              <Download size={18} /> 导出上次导入前的备份
+            </button>}
             <input ref={file} type="file" accept="application/json,.json" hidden onChange={(e) => e.target.files?.[0] && restore(e.target.files[0]).finally(() => (e.target.value = ""))} />
             <button
               className="btn btn-ghost btn-danger"
+              disabled={!writable}
               onClick={() => {
                 if (confirm("确定清空这个词库的全部学习记录？此操作无法撤销，建议先导出备份。")) {
-                  resetProgress();
-                  toast("学习记录已清空");
+                  if (resetProgress()) toast("学习记录已清空");
                 }
               }}
             >

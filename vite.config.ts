@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import fs from "node:fs";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { atlasReleasePlugin } from "./scripts/atlas-release";
 // Local-only content is never copied into dist or the public archive.
 function localMedia(
   req: IncomingMessage,
@@ -89,6 +90,7 @@ export default defineConfig({
   base: process.env.ATLAS_BASE || "/",
   plugins: [
     react(),
+    atlasReleasePlugin(),
     {
       name: "private-local-library",
       configureServer(server) {

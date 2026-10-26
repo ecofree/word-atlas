@@ -1,8 +1,8 @@
 import type { Atlas, Entry, IndexRow, WordRef } from "./types";
 import { MEDIA } from "./types";
+import { validRelease, type AtlasRelease } from "./release";
 
-const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
-const url = (p: string) => `${BASE}/atlas/${p}`;
+const BASE = (import.meta.env?.BASE_URL ?? "/").replace(/\/$/, "");
 
 interface IndexFile {
   id: string;
@@ -14,12 +14,23 @@ interface IndexFile {
   topics: [string, string][];
   cefr: string[];
   words: IndexRow[];
+  release?: AtlasRelease;
 }
 
-export async function loadOpenAtlas(): Promise<Atlas> {
-  const res = await fetch(url("index.json"));
+export async function loadOpenAtlas(
+  request: typeof fetch = fetch,
+  base = BASE,
+  requireRelease = import.meta.env?.PROD ?? false,
+): Promise<Atlas> {
+  const url = (p: string) => `${base.replace(/\/$/, "")}/atlas/${p}`;
+  const res = await request(url("index.json"), { cache: "no-cache" });
   if (!res.ok) throw new Error(`词库索引加载失败（${res.status}）`);
   const idx = (await res.json()) as IndexFile;
+  if (!Number.isInteger(idx.chunk) || idx.chunk < 1 || !Array.isArray(idx.words) || idx.words.length !== idx.count ||
+      (requireRelease && idx.release === undefined) ||
+      (idx.release !== undefined && !validRelease(idx.release, Math.ceil(idx.count / idx.chunk)))) {
+    throw new Error("词库索引版本无效，请重新加载。");
+  }
   const words: WordRef[] = idx.words.map((r, order) => ({
     id: r[0],
     word: r[1],
@@ -37,12 +48,20 @@ export async function loadOpenAtlas(): Promise<Atlas> {
   const loadChunk = (n: number) => {
     let p = pending.get(n);
     if (!p) {
-      p = fetch(url(`entries/${n}.json`))
+      const address = idx.release?.chunks[n];
+      // Fetch integrity works without crypto.subtle, including local HTTP development.
+      p = request(url(address?.file ?? `entries/${n}.json`), address ? { integrity: address.integrity } : { cache: "no-cache" })
         .then((r) => {
           if (!r.ok) throw new Error(`词条加载失败（${r.status}）`);
           return r.json() as Promise<Entry[]>;
         })
-        .then((list) => list.forEach((e) => cache.set(e.id, e)))
+        .then((list) => {
+          const rows = idx.words.slice(n * idx.chunk, (n + 1) * idx.chunk);
+          if (!Array.isArray(list) || list.length !== rows.length || list.some((e, k) => !e || e.id !== rows[k][0] || e.w !== rows[k][1])) {
+            throw new Error("词库分块与索引不一致，请重试或重新加载。");
+          }
+          list.forEach((e) => cache.set(e.id, e));
+        })
         .catch((e) => {
           pending.delete(n);
           throw e;
