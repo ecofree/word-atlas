@@ -788,11 +788,26 @@ async function testSpellVariant(browser, origin, spelling) {
     await waitForWriteAccess(page, "writable");
     assert.equal(await page.locator(".slots .slot").count(), 6);
     assert.match(await page.locator(".spell-input").getAttribute("aria-label"), /提示词形 6 个字符/);
+    const hintPrefixes = [];
     if (spelling === "cheque") {
       const hint = page.getByRole("button", { name: "提示字母", exact: true });
-      for (let i = 0; i < 5; i++) await hint.click();
+      for (let i = 0; i < 5; i++) {
+        await hint.click();
+        const prefix = spelling.slice(0, i + 1);
+        // A click finishing does not guarantee that React has committed its
+        // resulting input/focus state. Assert the outcome, not a fixed delay.
+        await pollPage(page, (expected) => {
+          const input = document.querySelector(".spell-input");
+          return input?.value === expected && document.activeElement === input;
+        }, prefix);
+        hintPrefixes.push(await page.locator(".spell-input").inputValue());
+      }
       assert.equal(await hint.isDisabled(), true);
       assert.equal(await page.locator(".spell-input").inputValue(), "chequ");
+      await page.locator(".spell-input").fill("");
+      assert.equal(await page.locator(".spell-input").inputValue(), "", "Hints must not force a prefix back after the learner clears the input.");
+      await page.locator(".spell-input").fill("edited");
+      assert.equal(await page.locator(".spell-input").inputValue(), "edited", "The learner can still edit hinted input.");
     }
     await page.locator(".spell-input").fill(spelling);
     await page.locator(".spell-input").press("Enter");
@@ -800,11 +815,54 @@ async function testSpellVariant(browser, origin, spelling) {
     const state = await learningState(page);
     assert.equal(state.pending.correct, true);
     assert.equal(state.pending.value, spelling);
+    await pollPage(page, (length) => document.querySelectorAll(".slots .slot").length === length &&
+      document.querySelectorAll(".slots .slot.is-bad").length === 0 && document.querySelector(".spell-input")?.readOnly, spelling.length);
     assert.equal(await page.locator(".slots .slot").count(), spelling.length);
     assert.equal(await page.locator(".slots .slot.is-bad").count(), 0);
     assert.equal(await page.locator(".spell-input").inputValue(), spelling);
+    let immediateHintGrade;
+    let immediateHintValue;
+    if (spelling === "cheque") {
+      assert.equal(state.graded[cheque[0]], 2, "A correct answer after hints must use the hinted grade.");
+      // Reset only this isolated fixture, then dispatch hint and submit in one
+      // browser task to detect a stale value or hint count in the submit handler.
+      const fresh = { ...progress, session: { ...progress.session, id: "same-task-hint-submit" } };
+      await page.evaluate(async (fixture) => {
+        const { store } = await import("/src/store/store.ts");
+        if (!store.progress(() => fixture)) throw new Error("Could not reset the isolated spelling fixture.");
+      }, fresh);
+      await page.locator(".spell-input:not([readonly])").waitFor();
+      await page.locator(".spell-input").fill("cheque");
+      await page.evaluate(() => {
+        document.querySelector(".spell-actions button[type=button]").click();
+        document.querySelector("form.spell").requestSubmit();
+      });
+      await pollPage(page, async () => !!(await import("/src/store/store.ts")).store.get().progress.session?.pending);
+      const immediate = await learningState(page);
+      assert.equal(immediate.pending.value, "cheque");
+      assert.equal(immediate.pending.correct, true);
+      immediateHintGrade = immediate.graded[cheque[0]];
+      assert.equal(immediateHintGrade, 2, "A same-task hint then submit must not use the unhinted grade.");
+
+      await page.evaluate(async (fixture) => {
+        const { store } = await import("/src/store/store.ts");
+        if (!store.progress(() => fixture)) throw new Error("Could not reset the isolated spelling fixture.");
+      }, { ...progress, session: { ...progress.session, id: "same-task-hint-value" } });
+      await page.locator(".spell-input:not([readonly])").waitFor();
+      await page.locator(".spell-input").fill("edited");
+      await page.evaluate(() => {
+        document.querySelector(".spell-actions button[type=button]").click();
+        document.querySelector("form.spell").requestSubmit();
+      });
+      await pollPage(page, async () => !!(await import("/src/store/store.ts")).store.get().progress.session?.pending);
+      const replaced = await learningState(page);
+      immediateHintValue = replaced.pending.value;
+      assert.equal(immediateHintValue, "c", "A same-task submit must use the hint's replacement value.");
+      assert.equal(replaced.pending.correct, false);
+      assert.equal(replaced.graded[cheque[0]], 1);
+    }
     assert.deepEqual(pageErrors, []);
-    return { spelling, initialSlots: 6, correctSlots: spelling.length, accepted: true, hintsLimitedToPreferredForm: spelling === "cheque", pageErrors };
+    return { spelling, initialSlots: 6, correctSlots: spelling.length, accepted: true, hintsLimitedToPreferredForm: spelling === "cheque", hintPrefixes, immediateHintGrade, immediateHintValue, pageErrors };
   } finally {
     await context.close();
   }

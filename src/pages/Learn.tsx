@@ -155,11 +155,10 @@ function Quiz({ step, session }: { step: Step & { kind: QuizKind }; session: Act
   const writable = useStore((s) => s.writeAccess === "writable");
   const pending = session.pending;
   const elapsed = useStepTimer(!!entry && writable);
-  const [hints, setHints] = useState(0);
   const options = useMemo(() => (step.options ?? []).map((id) => atlas.byId.get(id)!).filter(Boolean), [atlas, step.options]);
 
   const submit = useCallback(
-    (value: string, correct: boolean) => {
+    (value: string, correct: boolean, hinted = false) => {
       if (!entry || pending || store.get().writeAccess !== "writable") return;
       const ms = elapsed() * 1000;
       if (correct) {
@@ -168,10 +167,10 @@ function Quiz({ step, session }: { step: Step & { kind: QuizKind }; session: Act
         if (r) burst(r.left + r.width / 2, r.top + r.height / 2);
       }
       if (settings.sfx) void cue(correct ? "correct" : "wrong");
-      answer(atlas, step, correct, gradeFor(step.kind, correct, ms, hints > 0), value);
+      answer(atlas, step, correct, gradeFor(step.kind, correct, ms, hinted), value);
       if (entry) void play(atlas.audio(entry, settings.accent), entry.w, settings.accent);
     },
-    [pending, elapsed, settings, atlas, step, hints, entry],
+    [pending, elapsed, settings, atlas, step, entry],
   );
 
   const next = useCallback(() => {
@@ -241,11 +240,11 @@ function Quiz({ step, session }: { step: Step & { kind: QuizKind }; session: Act
             </button>
           </div>
         )}
-        {step.kind === "spell" && <SpellPrompt entry={entry} refw={ref} hints={hints} />}
+        {step.kind === "spell" && <SpellPrompt entry={entry} refw={ref} />}
       </section>
 
       {step.kind === "spell" ? (
-        <SpellInput entry={entry} pending={pending} hints={hints} onHint={() => setHints((h) => Math.min(Math.max(0, Array.from(preferredForm(entry.w)).length - 1), h + 1))} onSubmit={(v) => submit(v, acceptsAnswer(v, entry.w))} />
+        <SpellInput entry={entry} pending={pending} onSubmit={(v, hinted) => submit(v, acceptsAnswer(v, entry.w), hinted)} />
       ) : (
         <ul className={`options ${step.kind === "meaning" ? "options-zh" : "options-en"}`}>
           {options.map((o, i) => {
@@ -271,11 +270,10 @@ function Quiz({ step, session }: { step: Step & { kind: QuizKind }; session: Act
   );
 }
 
-function SpellPrompt({ entry, refw, hints }: { entry: Entry; refw: WordRef; hints: number }) {
+function SpellPrompt({ entry, refw }: { entry: Entry; refw: WordRef }) {
   const atlas = useAtlas();
   const accent = useStore((s) => s.settings.accent);
   const sentence = entry.ex[0] ? gap(entry.ex[0].en, entry.w) : null;
-  void hints;
   return (
     <div className="prompt-spell">
       <Illustration src={atlas.img(entry)} word={entry.w} topic={refw.topic} eager className="spell-art" />
@@ -296,17 +294,31 @@ function SpellPrompt({ entry, refw, hints }: { entry: Entry; refw: WordRef; hint
   );
 }
 
-function SpellInput({ entry, pending, hints, onHint, onSubmit }: { entry: Entry; pending?: { correct: boolean; value: string }; hints: number; onHint: () => void; onSubmit: (v: string) => void }) {
-  const [value, setValue] = useState("");
+function SpellInput({ entry, pending, onSubmit }: { entry: Entry; pending?: { correct: boolean; value: string }; onSubmit: (v: string, hinted: boolean) => void }) {
+  const [draft, setDraft] = useState({ value: "", hints: 0 });
+  // Keep event handlers on the same answer/hint snapshot, including a hint and
+  // submit dispatched before React commits the updated input.
+  const latest = useRef(draft);
+  const update = (next: typeof draft) => {
+    latest.current = next;
+    setDraft(next);
+  };
+  const { value, hints } = draft;
   const input = useRef<HTMLInputElement>(null);
   const alternatives = acceptedForms(entry.w);
   const target = preferredForm(entry.w);
   const targetLength = Array.from(target).length;
-  const prefix = Array.from(target).slice(0, hints).join("");
-  useEffect(() => {
-    if (hints && !normalize(value).startsWith(normalize(prefix))) setValue(prefix);
+  const hint = () => {
+    if (pending) return;
+    const current = latest.current;
+    const nextHints = Math.min(Math.max(0, targetLength - 1), current.hints + 1);
+    const prefix = Array.from(target).slice(0, nextHints).join("");
+    update({
+      hints: nextHints,
+      value: normalize(current.value).startsWith(normalize(prefix)) ? current.value : prefix,
+    });
     input.current?.focus();
-  }, [hints]); // eslint-disable-line react-hooks/exhaustive-deps
+  };
   const shown = pending ? pending.value : value;
   // A valid alternative can have another length: show its own correct slots after submission.
   const slotTarget = pending?.correct ? alternatives.find((form) => normalize(form) === normalize(shown)) ?? target : target;
@@ -316,7 +328,8 @@ function SpellInput({ entry, pending, hints, onHint, onSubmit }: { entry: Entry;
       className="spell"
       onSubmit={(e) => {
         e.preventDefault();
-        if (!pending && value.trim()) onSubmit(value);
+        const current = latest.current;
+        if (!pending && current.value.trim()) onSubmit(current.value, current.hints > 0);
       }}
     >
       <div className="slots" aria-hidden="true" onClick={() => input.current?.focus()}>
@@ -334,7 +347,7 @@ function SpellInput({ entry, pending, hints, onHint, onSubmit }: { entry: Entry;
         ref={input}
         className="spell-input"
         value={shown}
-        onChange={(e) => !pending && setValue(e.target.value.slice(0, Math.max(target.length, ...alternatives.map((form) => form.length)) + 6))}
+        onChange={(e) => !pending && update({ ...latest.current, value: e.target.value.slice(0, Math.max(target.length, ...alternatives.map((form) => form.length)) + 6) })}
         autoFocus
         autoCapitalize="off"
         autoCorrect="off"
@@ -346,7 +359,7 @@ function SpellInput({ entry, pending, hints, onHint, onSubmit }: { entry: Entry;
       />
       {!pending && (
         <div className="spell-actions">
-          <button type="button" className="btn btn-ghost" onClick={onHint} disabled={hints >= targetLength - 1}>
+          <button type="button" className="btn btn-ghost" onClick={hint} disabled={hints >= targetLength - 1}>
             <Lightbulb size={17} /> 提示字母
           </button>
           <button type="submit" className="btn btn-primary" disabled={!value.trim()}>
