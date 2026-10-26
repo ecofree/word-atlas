@@ -1,5 +1,5 @@
 import { Volume2 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { play } from "../lib/audio";
 
 export function Speak({
@@ -22,13 +22,16 @@ export function Speak({
   kbd?: string;
 }) {
   const [on, setOn] = useState(false);
+  const request = useRef(0);
+  useEffect(() => () => { request.current++; }, []);
   const run = async (e: React.MouseEvent) => {
     e.stopPropagation();
+    const mine = ++request.current;
     setOn(true);
     try {
       await play(url, text, accent, rate);
     } finally {
-      setOn(false);
+      if (mine === request.current) setOn(false);
     }
   };
   return (

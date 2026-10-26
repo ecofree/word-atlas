@@ -2,9 +2,9 @@
 
 ## 数据去哪里
 
-词光没有账号、服务器端存储、统计或追踪。学习进度只保存在当前浏览器的 localStorage，可以在「我的」里导出为 JSON 备份。导入备份时会逐字段校验，畸形数据会被丢弃。
+词光没有账号、服务器端存储、统计或追踪。学习进度只保存在当前浏览器的 localStorage，可以在「我的」里导出为 JSON 备份。导入前会完整校验版本、词库和学习记录；格式不受支持或记录损坏时拒绝整个导入，保留现有进度。有效导入也会先保存可导出的导入前恢复副本。
 
-Word Atlas has no accounts, server-side storage, analytics or tracking. Progress lives in the browser's localStorage and can be exported as JSON. Imported backups are validated field by field.
+Word Atlas has no accounts, server-side storage, analytics or tracking. Progress lives in the browser's localStorage and can be exported as JSON. Unsupported or malformed backups are rejected before replacing existing progress. A valid import first saves an exportable recovery copy of the previous data.
 
 ## 凭据 / Credentials
 

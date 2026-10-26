@@ -23,12 +23,18 @@ import { createServer } from "vite";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const transparentPixel = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1cAAAAASUVORK5CYII=", "base64");
-// A short valid PCM WAV prevents media requests from hitting missing sparse assets.
-const silentWave = Buffer.alloc(44 + 800);
-silentWave.write("RIFF", 0); silentWave.writeUInt32LE(silentWave.length - 8, 4); silentWave.write("WAVEfmt ", 8);
-silentWave.writeUInt32LE(16, 16); silentWave.writeUInt16LE(1, 20); silentWave.writeUInt16LE(1, 22);
-silentWave.writeUInt32LE(8000, 24); silentWave.writeUInt32LE(16000, 28); silentWave.writeUInt16LE(2, 32);
-silentWave.writeUInt16LE(16, 34); silentWave.write("data", 36); silentWave.writeUInt32LE(800, 40);
+// Valid silent PCM WAVs exercise native decoding without downloaded media.
+function silentPcm(milliseconds) {
+  const size = Math.round(milliseconds * 16); // 8kHz mono, 16 bits per sample.
+  const wave = Buffer.alloc(44 + size);
+  wave.write("RIFF", 0); wave.writeUInt32LE(wave.length - 8, 4); wave.write("WAVEfmt ", 8);
+  wave.writeUInt32LE(16, 16); wave.writeUInt16LE(1, 20); wave.writeUInt16LE(1, 22);
+  wave.writeUInt32LE(8000, 24); wave.writeUInt32LE(16000, 28); wave.writeUInt16LE(2, 32);
+  wave.writeUInt16LE(16, 34); wave.write("data", 36); wave.writeUInt32LE(size, 40);
+  return wave;
+}
+const silentWave = silentPcm(50);
+const loopWave = silentPcm(1000);
 
 const cases = {
   "load-retry": testLoadRetry,
@@ -47,6 +53,10 @@ const cases = {
   "spell-cheque": (browser, origin) => testSpellVariant(browser, origin, "cheque"),
   "spell-check": (browser, origin) => testSpellVariant(browser, origin, "check"),
   "picture-so": testPictureSo,
+  "galaxy-selection": testGalaxySelection,
+  "media-ambience-race": testMediaAmbienceRace,
+  "media-cue-retry": testMediaCueRetry,
+  "media-pronunciation-cancel": testMediaPronunciationCancel,
 };
 const selected = [];
 let output;
@@ -110,6 +120,12 @@ function savedProgress(word = target) {
 
 function practiceProgress(ids) {
   return { ...resumedQuiz(), cards: {}, days: {}, typing: [], bookmarks: ids, session: null };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 async function learningState(page) {
@@ -216,6 +232,54 @@ async function openSavedPractice(page, origin, mode = "word") {
   await page.getByRole("button", { name: "收藏", exact: true }).click();
   await page.getByRole("button", { name: "开始一轮", exact: true }).click();
   await page.locator(".typing-input:not([readonly])").waitFor();
+}
+
+/** Observe native Web Audio and HTMLAudioElement behavior without replacing it. */
+async function observeNativeAudio(context) {
+  await context.addInitScript(() => {
+    window.__audioStarts = [];
+    window.__audioStops = [];
+    window.__gainRamps = [];
+    window.__decodeFailures = 0;
+    window.__decodedBuffers = [];
+    window.__recordings = [];
+    window.__recordingEvents = [];
+    const start = AudioBufferSourceNode.prototype.start;
+    AudioBufferSourceNode.prototype.start = function (...args) {
+      window.__audioStarts.push({ loop: this.loop, duration: this.buffer?.duration ?? 0 });
+      return start.apply(this, args);
+    };
+    const stop = AudioBufferSourceNode.prototype.stop;
+    AudioBufferSourceNode.prototype.stop = function (...args) {
+      window.__audioStops.push({ loop: this.loop });
+      return stop.apply(this, args);
+    };
+    const ramp = AudioParam.prototype.linearRampToValueAtTime;
+    AudioParam.prototype.linearRampToValueAtTime = function (value, at) {
+      window.__gainRamps.push(value);
+      return ramp.call(this, value, at);
+    };
+    const decode = AudioContext.prototype.decodeAudioData;
+    AudioContext.prototype.decodeAudioData = function (...args) {
+      return decode.apply(this, args).then((buffer) => {
+        window.__decodedBuffers.push(buffer.duration);
+        return buffer;
+      }, (error) => { window.__decodeFailures++; throw error; });
+    };
+    const NativeAudio = window.Audio;
+    function ObservedAudio(...args) {
+      const audio = new NativeAudio(...args);
+      const id = window.__recordings.length;
+      window.__recordings.push(audio);
+      for (const type of ["play", "playing", "pause", "ended", "error"]) audio.addEventListener(type, () => {
+        window.__recordingEvents.push({ id, type, ended: audio.ended, paused: audio.paused });
+      });
+      return audio;
+    }
+    ObservedAudio.prototype = NativeAudio.prototype;
+    Object.setPrototypeOf(ObservedAudio, NativeAudio);
+    window.Audio = ObservedAudio;
+  });
 }
 
 async function testLoadRetry(browser, origin) {
@@ -761,6 +825,202 @@ async function testPictureSo(browser, origin) {
     assert.deepEqual(pageErrors, []);
     return { headword: "so", unrelatedSoupPreserved: true, cloze, pageErrors };
   } finally {
+    await context.close();
+  }
+}
+
+async function testGalaxySelection(browser, origin) {
+  const { context, page, pageErrors } = await createCase(browser, origin);
+  try {
+    const start = Date.parse("2026-10-26T10:00:00Z");
+    await page.clock.install({ time: start - 60_000 });
+    await page.goto(`${origin}/#/atlas?view=galaxy`, { waitUntil: "domcontentloaded" });
+    await page.locator(".galaxy-full canvas").waitFor();
+    await page.clock.pauseAt(start);
+    // Hit-testing is deterministic; all pointer events, flyTo, routing and React
+    // lifecycle remain the real application code and real canvas element.
+    await page.evaluate(async () => {
+      const { GalaxyEngine } = await import("/src/galaxy/engine.ts");
+      window.__galaxyHit = 0;
+      GalaxyEngine.prototype.pick = function () { return window.__galaxyHit; };
+    });
+    const clickStar = async (hit) => {
+      await page.evaluate((value) => { window.__galaxyHit = value; }, hit);
+      const box = await page.locator(".galaxy-full canvas").boundingBox();
+      assert.ok(box);
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    };
+    await clickStar(0);
+    await page.locator('.topnav a[href="#/me"]').click();
+    await page.getByRole("heading", { name: "你的星空", exact: true }).waitFor();
+    await page.clock.runFor(1000);
+    assert.equal(await page.getByRole("dialog").count(), 0, "An unmounted galaxy must not open its delayed word card.");
+    assert.equal(new URL(page.url()).hash, "#/me");
+
+    await page.locator('.topnav a[href="#/atlas"]').click();
+    await page.locator(".galaxy-full canvas").waitFor();
+    await clickStar(0);
+    await page.clock.runFor(100);
+    await clickStar(1);
+    await page.clock.runFor(250);
+    assert.equal(await page.getByRole("dialog").count(), 0, "A superseded selection must not open at its old deadline.");
+    await page.clock.runFor(100);
+    await page.getByRole("dialog", { name: `${searched[1]} 词条`, exact: true }).waitFor();
+    assert.equal(await page.getByRole("dialog", { name: `${target[1]} 词条`, exact: true }).count(), 0);
+    assert.deepEqual(pageErrors, []);
+    return { navigationCancelledDelayedOpen: true, latestSelectionOnly: true, pointerPath: "native canvas mouse events with deterministic pick", pageErrors };
+  } finally {
+    await context.close();
+  }
+}
+
+async function testMediaAmbienceRace(browser, origin) {
+  const gates = { stars: deferred(), rain: deferred(), sea: deferred() };
+  const { context, page, pageErrors } = await createCase(browser, origin, async (route, url) => {
+    const match = /\/sfx\/amb-(stars|rain|sea)\.mp3$/.exec(url.pathname);
+    if (!match) return false;
+    await gates[match[1]].promise;
+    await route.fulfill({ status: 200, contentType: "audio/wav", body: loopWave }).catch(() => {});
+    return true;
+  }, undefined, { ambienceVolume: 0.8 });
+  await observeNativeAudio(context);
+  try {
+    await page.goto(`${origin}/#/me`, { waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: "你的星空", exact: true }).waitFor();
+    await page.getByRole("button", { name: "环境声", exact: true }).click();
+    const picker = page.getByRole("dialog", { name: "环境声", exact: true });
+    const starsRequested = page.waitForRequest((request) => request.url().endsWith("/sfx/amb-stars.mp3"));
+    await picker.getByRole("button", { name: "星空音乐", exact: true }).click();
+    await starsRequested;
+    const rainRequested = page.waitForRequest((request) => request.url().endsWith("/sfx/amb-rain.mp3"));
+    await picker.getByRole("button", { name: "雨天图书馆", exact: true }).click();
+    await rainRequested;
+    gates.stars.resolve();
+    await pollPage(page, () => window.__decodedBuffers.some((duration) => duration > 0.9));
+    assert.equal(await page.evaluate(async () => (await import("/src/lib/sound.ts")).ambienceId()), null, "An older decoded request must not win while the latest choice is still loading.");
+    assert.equal(await page.evaluate(() => window.__audioStarts.filter((source) => source.loop).length), 0);
+    gates.rain.resolve();
+    await pollPage(page, async () => (await import("/src/lib/sound.ts")).ambienceId() === "rain");
+    const seaRequested = page.waitForRequest((request) => request.url().endsWith("/sfx/amb-sea.mp3"));
+    await picker.getByRole("button", { name: "清晨海岸", exact: true }).click();
+    await seaRequested;
+    await picker.getByRole("button", { name: "安静", exact: true }).click();
+    gates.sea.resolve();
+    await pollPage(page, () => window.__decodedBuffers.filter((duration) => duration > 0.9).length === 3);
+    assert.equal(await page.evaluate(async () => (await import("/src/lib/sound.ts")).ambienceId()), null, "Turning ambience off must also cancel a pending selection.");
+    const evidence = await page.evaluate(() => ({ nativeLoopsStarted: window.__audioStarts.filter((source) => source.loop).length, nativeLoopsStopped: window.__audioStops.filter((source) => source.loop).length }));
+    assert.deepEqual(evidence, { nativeLoopsStarted: 1, nativeLoopsStopped: 1 });
+    assert.deepEqual(pageErrors, []);
+    return { ...evidence, latestRequestWins: true, pendingOffStayedOff: true, nativeWebAudio: true, pageErrors };
+  } finally {
+    Object.values(gates).forEach((gate) => gate.resolve());
+    await context.close();
+  }
+}
+
+async function testMediaCueRetry(browser, origin) {
+  const requests = { correct: 0, wrong: 0 };
+  const { context, page, pageErrors } = await createCase(browser, origin, async (route, url) => {
+    const match = /\/sfx\/(correct|wrong)\.mp3$/.exec(url.pathname);
+    if (!match) return false;
+    const name = match[1];
+    requests[name]++;
+    if (requests[name] === 1) {
+      await route.fulfill({ status: name === "correct" ? 500 : 200, contentType: "audio/mpeg", body: "temporary invalid audio" });
+    } else await route.fulfill({ status: 200, contentType: "audio/wav", body: silentWave });
+    return true;
+  });
+  await observeNativeAudio(context);
+  try {
+    await page.goto(`${origin}/#/me`, { waitUntil: "domcontentloaded" });
+    // A real gesture primes the application's actual shared cue cache.
+    await page.getByRole("heading", { name: "你的星空", exact: true }).click();
+    await pollPage(page, () => window.__decodeFailures === 1);
+    assert.deepEqual(requests, { correct: 1, wrong: 1 });
+    await page.evaluate(async () => {
+      const { cue } = await import("/src/lib/sound.ts");
+      await cue("correct");
+      await cue("wrong");
+    });
+    assert.deepEqual(requests, { correct: 2, wrong: 2 }, "Both HTTP and native decode failures must be retried.");
+    const starts = await page.evaluate(() => window.__audioStarts.filter((source) => !source.loop));
+    assert.equal(starts.length, 2);
+    assert.ok(starts.every((source) => source.duration > 0));
+    assert.deepEqual(pageErrors, []);
+    return { requests, nativeCueStarts: starts.length, httpFailureRetried: true, decodeFailureRetried: true, pageErrors };
+  } finally {
+    await context.close();
+  }
+}
+
+async function testMediaPronunciationCancel(browser, origin) {
+  const recordings = deferred();
+  const pending = deferred();
+  const { context, page, pageErrors } = await createCase(browser, origin, async (route, url) => {
+    if (url.pathname === "/sfx/amb-rain.mp3") {
+      await route.fulfill({ status: 200, contentType: "audio/wav", body: loopWave });
+      return true;
+    }
+    if (url.pathname.includes("/atlas/audio/")) {
+      await recordings.promise;
+      await route.fulfill({ status: 200, contentType: "audio/wav", body: silentPcm(300) }).catch(() => {});
+      return true;
+    }
+    if (url.pathname === "/__media/pending.wav") {
+      await pending.promise;
+      await route.fulfill({ status: 200, contentType: "audio/wav", body: silentWave }).catch(() => {});
+      return true;
+    }
+    if (url.pathname === "/__media/brief.wav") {
+      await route.fulfill({ status: 200, contentType: "audio/wav", body: silentPcm(300) });
+      return true;
+    }
+    return false;
+  }, undefined, { ambienceVolume: 0.8 });
+  await observeNativeAudio(context);
+  try {
+    await page.goto(`${origin}/#/learn`, { waitUntil: "domcontentloaded" });
+    await page.locator(".prompt-word .speak").waitFor();
+    await waitForWriteAccess(page, "writable");
+    await page.getByRole("button", { name: "环境声", exact: true }).click();
+    await page.getByRole("dialog", { name: "环境声", exact: true }).getByRole("button", { name: "雨天图书馆", exact: true }).click();
+    await pollPage(page, async () => (await import("/src/lib/sound.ts")).ambienceId() === "rain");
+    await page.keyboard.press("Escape");
+    const speak = page.locator(".prompt-word .speak");
+    await speak.click();
+    await pollPage(page, () => window.__recordings.length === 1);
+    await speak.click();
+    await pollPage(page, () => window.__recordings.length === 2);
+    // Let the cancelled request's finally blocks run while the replacement is
+    // still waiting on its real HTMLAudioElement network response.
+    await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    assert.equal(await speak.evaluate((element) => element.classList.contains("is-on")), true, "Cancelling A must not clear the same button's active B state.");
+    const active = await page.evaluate(() => ({ paused: window.__recordings.map((audio) => audio.paused), ramp: window.__gainRamps.at(-1) }));
+    assert.deepEqual(active.paused, [true, false]);
+    assert.ok(Math.abs(active.ramp - 0.8 * 0.35 * 0.9) < 1e-8, "An old completion must not remove ducking under the replacement pronunciation.");
+    await page.evaluate(async () => (await import("/src/lib/audio.ts")).stopAudio());
+    await pollPage(page, () => !document.querySelector(".prompt-word .speak.is-on"));
+    const stopped = await page.evaluate(() => ({ paused: window.__recordings.map((audio) => audio.paused), ramp: window.__gainRamps.at(-1) }));
+    assert.deepEqual(stopped.paused, [true, true]);
+    assert.ok(Math.abs(stopped.ramp - 0.8 * 0.9) < 1e-8);
+    recordings.resolve();
+
+    const ended = await page.evaluate(async () => (await import("/src/lib/audio.ts")).play("/__media/brief.wav", "native recording"));
+    const nativeEvents = await page.evaluate(() => window.__recordingEvents);
+    assert.equal(ended, "recorded", `A real recording must still finish normally after rapid cancellation: ${JSON.stringify(nativeEvents)}`);
+    await page.evaluate(async () => {
+      const { play } = await import("/src/lib/audio.ts");
+      window.__pendingPlayback = "waiting";
+      void play("/__media/pending.wav", "pending recording").then((result) => { window.__pendingPlayback = result; });
+    });
+    await page.evaluate(async () => (await import("/src/lib/audio.ts")).stopAudio());
+    await pollPage(page, () => window.__pendingPlayback === "stopped");
+    pending.resolve();
+    assert.deepEqual(pageErrors, []);
+    return { sameButtonReplacementStayedActive: true, oldRequestKeptNewDucking: true, stopRestoredVolume: true, nativeRecordingResult: ended, nativeEvents, pendingPlaySettledImmediately: true, pageErrors };
+  } finally {
+    recordings.resolve();
+    pending.resolve();
     await context.close();
   }
 }

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Plugin, ResolvedConfig } from "vite";
 import type { AtlasRelease } from "../src/atlas/release";
+import { publishOfflineRelease } from "./offline-release";
 
 function separateDirectories(sourceDir: string, outputDir: string) {
   // Resolve existing ancestors too: a new output path can sit below a symlink into public/.
@@ -73,7 +74,9 @@ export function atlasReleasePlugin(): Plugin {
       separateDirectories(config.publicDir, path.resolve(config.root, config.build.outDir));
     },
     closeBundle() {
-      publishAtlasRelease(path.join(config.publicDir, "atlas"), path.resolve(config.root, config.build.outDir, "atlas"));
+      const outputDir = path.resolve(config.root, config.build.outDir);
+      publishAtlasRelease(path.join(config.publicDir, "atlas"), path.join(outputDir, "atlas"));
+      publishOfflineRelease(outputDir, fs.readFileSync(path.join(config.publicDir, "sw.js"), "utf8"));
     },
   };
 }

@@ -41,11 +41,36 @@ Return strict JSON only: {"entries":[...]} with one entry per input word, same o
 Sentences must be safe for all ages, culturally neutral, and must not mention real brands or living public figures. Do not reuse the same names across entries; avoid 'Tom' and 'Mary'."""
 
 
+def validate_headwords(value):
+    """Validate the whole input before any credentials are read or jobs submitted."""
+    if not isinstance(value, list) or not value:
+        raise ValueError("headwords.json must contain a non-empty array")
+    headwords, seen = [], set()
+    for index, item in enumerate(value):
+        where = f"headwords.json[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{where} must be an object")
+        hid, word = item.get("hid"), item.get("word")
+        if type(hid) is not int or hid < 0 or hid in seen:
+            raise ValueError(f"{where}.hid must be a unique non-negative integer")
+        if not isinstance(word, str) or not word.strip():
+            raise ValueError(f"{where}.word must be a non-empty string")
+        raw = item.get("raw")
+        if raw is None:
+            raw = []
+        if not isinstance(raw, list) or any(not isinstance(note, str) for note in raw):
+            raise ValueError(f"{where}.raw must be an array of strings, null, or omitted")
+        seen.add(hid)
+        headwords.append({**item, "word": word.strip(), "raw": [note.strip() for note in raw if note.strip()]})
+    return headwords
+
+
 def prompt_for(batch):
     lines = []
-    for g in batch:
+    for g in validate_headwords(batch):
         raw = " / ".join(g["raw"])[:160]
-        lines.append(f'- {g["word"]}  (notes: {raw})')
+        notes = f"  (notes: {raw})" if raw else ""
+        lines.append(f'- {g["word"]}{notes}')
     return "Words:\n" + "\n".join(lines)
 
 
@@ -74,7 +99,7 @@ def run_batch(env, model, idx, batch, outdir):
     for g, e in zip(batch, entries):
         e["hid"] = g["hid"]
         e["src"] = g["word"]
-    out.write_text(json.dumps(entries, ensure_ascii=False))
+    out.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
     return idx, "ok"
 
 
@@ -86,12 +111,24 @@ def main():
     ap.add_argument("--batch", type=int, default=20)
     ap.add_argument("--model", default="gpt-6")
     ap.add_argument("--out", default="text")
+    ap.add_argument("--check-input", action="store_true", help="validate headwords without credentials, model calls or output changes")
     a = ap.parse_args()
+    if a.start < 0 or a.limit < 0 or a.workers < 1 or a.batch < 1:
+        ap.error("--start and --limit must be non-negative; --workers and --batch must be positive")
+    try:
+        hw = validate_headwords(json.loads((FORGE / "headwords.json").read_text(encoding="utf-8")))
+        hw = hw[a.start:]
+        if a.limit:
+            hw = hw[: a.limit]
+        if not hw:
+            raise ValueError("--start/--limit selected no headwords")
+    except (OSError, ValueError) as error:
+        print(f"Input error: {error}", file=sys.stderr)
+        return 2
+    if a.check_input:
+        print(f"validated {len(hw)} selected headwords; no model calls or output changes")
+        return 0
     env = load_env()
-    hw = json.loads((FORGE / "headwords.json").read_text())
-    hw = hw[a.start:]
-    if a.limit:
-        hw = hw[: a.limit]
     outdir = FORGE / a.out
     outdir.mkdir(parents=True, exist_ok=True)
     batches = [hw[i : i + a.batch] for i in range(0, len(hw), a.batch)]
@@ -109,6 +146,7 @@ def main():
             if (done + fail) % 10 == 0:
                 print(f"progress {done+fail}/{len(batches)} fail={fail}", flush=True)
     print(f"finished ok={done} fail={fail}", flush=True)
+    return 1 if fail else 0
 
 
 if __name__ == "__main__":

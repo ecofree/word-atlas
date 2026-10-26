@@ -1,0 +1,56 @@
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          # No sparse checkout: check:atlas needs the real checked-in media.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - run: npm ci
+      - name: Unit tests
+        run: npm test
+      - name: Offline Python pipeline regressions
+        run: npm run test:pipeline
+      - name: Validate complete atlas and media
+        run: npm run check:atlas
+      - name: Typecheck and production build
+        run: npm run build
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Browser interaction regressions
+        run: npm run test:e2e -- --output output/e2e-regressions.json
+      - name: Browser storage failure regressions
+        run: npm run test:e2e:storage -- --output output/e2e-storage-failures.json
+      - name: Production offline and update regressions
+        run: npm run test:e2e:offline -- --output output/e2e-offline.json
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-regressions
+          path: output/e2e-*.json
+          if-no-files-found: ignore
+          retention-days: 7

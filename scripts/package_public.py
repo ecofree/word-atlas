@@ -26,7 +26,12 @@ TOP = {
     "README.md", "README.en.md", "LICENSE", "CONTENT_LICENSE.md", "CONTRIBUTING.md", "SECURITY.md",
     ".gitignore", "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts", "index.html",
 }
-SCRIPTS = {"check-atlas.mjs", "render-cards.mjs", "record-demo.mjs", "package_public.py", "output_transaction.py", "test_pipeline_safety.py", "atlas-release.ts", "test.mjs", "e2e-regressions.mjs", "e2e-storage-failures.mjs"}
+SCRIPTS = {
+    "check-atlas.mjs", "render-cards.mjs", "record-demo.mjs", "package_public.py",
+    "output_transaction.py", "test_pipeline_safety.py", "test_gen_text.py",
+    "atlas-release.ts", "offline-release.ts", "test.mjs", "e2e-regressions.mjs",
+    "e2e-storage-failures.mjs", "e2e-offline.mjs",
+}
 ATLAS_SCRIPTS = {"common.py", "gen_text.py", "gen_images.py", "gen_brand.py", "gen_word_audio.py", "gen_sentence_audio.py", "gen_sfx.py", "gen_galaxy_audio.sh", "fix_blocked.py", "build_atlas.py", "build_sfx.py"}
 TEXT = {".ts", ".tsx", ".css", ".svg", ".md", ".json", ".mjs", ".js", ".py", ".html", ".csv", ".yml", ".webmanifest", ""}
 PATTERNS = {
