@@ -7,7 +7,7 @@ import { burst } from "../lib/burst";
 import { cue } from "../lib/sound";
 import { go } from "../lib/router";
 import { handlePageShortcut } from "../lib/shortcuts";
-import { gap, normalize } from "../lib/text";
+import { acceptedForms, acceptsAnswer, gap, normalize, preferredForm } from "../lib/text";
 import { answer, advance, buildSession, gradeFor, sessionStats } from "../store/session";
 import { Rating } from "../store/srs";
 import { store, useStore, type ActiveSession, type QuizKind, type Step } from "../store/store";
@@ -245,7 +245,7 @@ function Quiz({ step, session }: { step: Step & { kind: QuizKind }; session: Act
       </section>
 
       {step.kind === "spell" ? (
-        <SpellInput entry={entry} pending={pending} hints={hints} onHint={() => setHints((h) => Math.min(entry.w.length - 1, h + 1))} onSubmit={(v) => submit(v, normalize(v) === normalize(entry.w))} />
+        <SpellInput entry={entry} pending={pending} hints={hints} onHint={() => setHints((h) => Math.min(Math.max(0, Array.from(preferredForm(entry.w)).length - 1), h + 1))} onSubmit={(v) => submit(v, acceptsAnswer(v, entry.w))} />
       ) : (
         <ul className={`options ${step.kind === "meaning" ? "options-zh" : "options-en"}`}>
           {options.map((o, i) => {
@@ -299,13 +299,18 @@ function SpellPrompt({ entry, refw, hints }: { entry: Entry; refw: WordRef; hint
 function SpellInput({ entry, pending, hints, onHint, onSubmit }: { entry: Entry; pending?: { correct: boolean; value: string }; hints: number; onHint: () => void; onSubmit: (v: string) => void }) {
   const [value, setValue] = useState("");
   const input = useRef<HTMLInputElement>(null);
-  const target = entry.w;
-  const prefix = target.slice(0, hints);
+  const alternatives = acceptedForms(entry.w);
+  const target = preferredForm(entry.w);
+  const targetLength = Array.from(target).length;
+  const prefix = Array.from(target).slice(0, hints).join("");
   useEffect(() => {
     if (hints && !normalize(value).startsWith(normalize(prefix))) setValue(prefix);
     input.current?.focus();
   }, [hints]); // eslint-disable-line react-hooks/exhaustive-deps
   const shown = pending ? pending.value : value;
+  // A valid alternative can have another length: show its own correct slots after submission.
+  const slotTarget = pending?.correct ? alternatives.find((form) => normalize(form) === normalize(shown)) ?? target : target;
+  const typedCharacters = Array.from(normalize(shown));
   return (
     <form
       className="spell"
@@ -315,11 +320,11 @@ function SpellInput({ entry, pending, hints, onHint, onSubmit }: { entry: Entry;
       }}
     >
       <div className="slots" aria-hidden="true" onClick={() => input.current?.focus()}>
-        {Array.from(target).map((ch, i) => {
-          const typed = shown[i];
-          const ok = typed !== undefined && typed.toLowerCase() === ch.toLowerCase();
+        {Array.from(slotTarget).map((ch, i) => {
+          const typed = typedCharacters[i];
+          const ok = typed !== undefined && normalize(typed) === normalize(ch);
           return (
-            <span key={i} className={`slot ${ch === " " ? "slot-space" : ""} ${typed !== undefined ? (pending ? (ok ? "is-ok" : "is-bad") : "is-filled") : ""} ${!pending && i === shown.length ? "is-caret" : ""}`}>
+            <span key={i} className={`slot ${ch === " " ? "slot-space" : ""} ${typed !== undefined ? (pending ? (ok ? "is-ok" : "is-bad") : "is-filled") : ""} ${!pending && i === typedCharacters.length ? "is-caret" : ""}`}>
               {pending && !pending.correct ? ch : typed ?? ""}
             </span>
           );
@@ -329,19 +334,19 @@ function SpellInput({ entry, pending, hints, onHint, onSubmit }: { entry: Entry;
         ref={input}
         className="spell-input"
         value={shown}
-        onChange={(e) => !pending && setValue(e.target.value.slice(0, target.length + 6))}
+        onChange={(e) => !pending && setValue(e.target.value.slice(0, Math.max(target.length, ...alternatives.map((form) => form.length)) + 6))}
         autoFocus
         autoCapitalize="off"
         autoCorrect="off"
         autoComplete="off"
         spellCheck={false}
         enterKeyHint="done"
-        aria-label={`拼写，${target.length} 个字符`}
+        aria-label={`拼写，提示词形 ${targetLength} 个字符`}
         readOnly={!!pending}
       />
       {!pending && (
         <div className="spell-actions">
-          <button type="button" className="btn btn-ghost" onClick={onHint} disabled={hints >= target.length - 1}>
+          <button type="button" className="btn btn-ghost" onClick={onHint} disabled={hints >= targetLength - 1}>
             <Lightbulb size={17} /> 提示字母
           </button>
           <button type="submit" className="btn btn-primary" disabled={!value.trim()}>

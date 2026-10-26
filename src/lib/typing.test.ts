@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { clean, same, typingDelta, typingMetrics } from "./typing";
+import { defaultSettings, emptyProgress, sanitizeProgress, validateBackup } from "../store/store";
 
 test("typing counts inserted characters and does not reward deletions", () => {
   assert.deepEqual(typingDelta("", "c", "cat"), { total: 1, correct: 1 });
@@ -99,4 +100,19 @@ test("metrics never emit NaN, Infinity, negatives or accuracy above 100", () => 
   assert.deepEqual(typingMetrics(20, 10, 10, 60000), { accuracy: 100, wpm: 2 });
   assert.deepEqual(typingMetrics(-1, 10, -10, 60000), { accuracy: 0, wpm: 0 });
   assert.deepEqual(typingMetrics(NaN, Infinity, 2, Infinity), { accuracy: 100, wpm: 0 });
+});
+
+test("a fast multi-character commit stays valid through persistence and backup import", () => {
+  const target = "a".repeat(100);
+  const first = typingDelta("", "a", target);
+  const pasted = typingDelta("a", target, target);
+  const metrics = typingMetrics(first.correct + pasted.correct, first.total + pasted.total, target.length, 1000);
+  assert.deepEqual(metrics, { wpm: 400, accuracy: 100 });
+  const round = { at: 1, mode: "sentence" as const, items: 1, ...metrics };
+  const progress = { ...emptyProgress("test"), typing: [round] };
+  assert.deepEqual(sanitizeProgress(JSON.parse(JSON.stringify(progress)), "test").typing, [round]);
+  const backup = { app: "word-atlas", version: 2, progress, settings: defaultSettings };
+  const checked = validateBackup(JSON.parse(JSON.stringify(backup)), "test");
+  assert.equal(checked.ok, true);
+  if (checked.ok) assert.deepEqual(checked.progress.typing, [round]);
 });

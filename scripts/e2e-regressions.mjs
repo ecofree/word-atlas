@@ -37,6 +37,16 @@ const cases = {
   "no-web-locks": testNoWebLocks,
   "backup-version-rejection": testBackupVersionRejection,
   "backup-recovery": testBackupRecovery,
+  "today-clock": testTodayClock,
+  "practice-pool": testPracticePool,
+  "practice-completion": testPracticeCompletion,
+  "practice-pause": testPracticePause,
+  "practice-save-retry": testPracticeSaveRetry,
+  "practice-variants": testPracticeVariants,
+  "practice-fast-input": testPracticeFastInput,
+  "spell-cheque": (browser, origin) => testSpellVariant(browser, origin, "cheque"),
+  "spell-check": (browser, origin) => testSpellVariant(browser, origin, "check"),
+  "picture-so": testPictureSo,
 };
 const selected = [];
 let output;
@@ -98,6 +108,10 @@ function savedProgress(word = target) {
   };
 }
 
+function practiceProgress(ids) {
+  return { ...resumedQuiz(), cards: {}, days: {}, typing: [], bookmarks: ids, session: null };
+}
+
 async function learningState(page) {
   return page.evaluate(async () => {
     const { store } = await import("/src/store/store.ts");
@@ -124,10 +138,26 @@ async function storedState(page) {
 }
 
 async function waitForWriteAccess(page, access) {
-  await page.waitForFunction(async (expected) => {
+  await pollPage(page, async (expected) => {
     const { store } = await import("/src/store/store.ts");
     return store.get().writeAccess === expected;
   }, access);
+}
+
+// Poll from Node so assertions still work while Playwright pauses the app clock.
+async function pollPage(page, predicate, value) {
+  const deadline = Date.now() + 20_000;
+  while (!await page.evaluate(predicate, value)) {
+    assert.ok(Date.now() < deadline, `Timed out waiting for page condition: ${predicate}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+async function visibility(page, value) {
+  await page.evaluate((state) => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }, value);
 }
 
 async function newPage(context, pageErrors) {
@@ -148,15 +178,15 @@ async function downloadJSON(page, buttonName) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-async function createCase(browser, origin, intercept, progress = resumedQuiz()) {
-  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, serviceWorkers: "block", reducedMotion: "reduce" });
+async function createCase(browser, origin, intercept, progress = resumedQuiz(), settingsPatch = {}) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, serviceWorkers: "block", reducedMotion: "reduce", timezoneId: "UTC" });
   await context.addInitScript(({ settings, progress, origin }) => {
     if (location.origin !== origin) return;
     // A second page and a reload must observe the first page's real saved data.
     if (localStorage.getItem("word-atlas:settings") === null) localStorage.setItem("word-atlas:settings", JSON.stringify(settings));
     const key = `word-atlas:v2:${progress.datasetId}`;
     if (localStorage.getItem(key) === null) localStorage.setItem(key, JSON.stringify(progress));
-  }, { settings, progress, origin });
+  }, { settings: { ...settings, ...settingsPatch }, progress, origin });
   await context.route("**/*", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -176,6 +206,16 @@ async function createCase(browser, origin, intercept, progress = resumedQuiz()) 
   const pageErrors = [];
   const page = await newPage(context, pageErrors);
   return { context, page, pageErrors };
+}
+
+async function openSavedPractice(page, origin, mode = "word") {
+  await page.goto(`${origin}/#/practice`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "让手，也记住它们。", exact: true }).waitFor();
+  await waitForWriteAccess(page, "writable");
+  if (mode === "sentence") await page.locator(".mode-card").filter({ hasText: "例句" }).click();
+  await page.getByRole("button", { name: "收藏", exact: true }).click();
+  await page.getByRole("button", { name: "开始一轮", exact: true }).click();
+  await page.locator(".typing-input:not([readonly])").waitFor();
 }
 
 async function testLoadRetry(browser, origin) {
@@ -420,6 +460,306 @@ async function testBackupRecovery(browser, origin) {
     assert.deepEqual(await storedState(page), after, "Imported data and its recovery copy must survive reload.");
     assert.deepEqual(pageErrors, []);
     return { recoverySavedBeforeReplacement: true, writeOrder: writes.map((write) => write.key), recoveryDownloadVerified: true, importedCards: Object.keys(after.progress.cards).length, pageErrors };
+  } finally {
+    await context.close();
+  }
+}
+
+async function testTodayClock(browser, origin) {
+  const start = Date.parse("2026-10-26T23:59:57Z");
+  const progress = savedProgress();
+  progress.cards[target[0]].due = start + 2000;
+  progress.days = { "2026-10-26": { n: 2, r: 2, c: 2, t: 30 } };
+  const { context, page, pageErrors } = await createCase(browser, origin, undefined, progress, { dailyNew: 2 });
+  try {
+    await page.clock.install({ time: start - 60_000 });
+    await page.goto(`${origin}/#/`, { waitUntil: "domcontentloaded" });
+    await page.locator(".journey h2").waitFor();
+    await waitForWriteAccess(page, "writable");
+    await page.clock.pauseAt(start);
+    assert.match(await page.locator(".journey h2").textContent(), /今天的星，都亮了/);
+    const firstWord = await page.locator(".wotd-word").textContent();
+    await page.clock.runFor(2000);
+    await pollPage(page, () => /复习\s*1/.test(document.querySelector(".journey h2")?.textContent ?? ""));
+    assert.doesNotMatch(await page.locator(".journey h2").textContent(), /新词/);
+    await page.clock.runFor(1000);
+    await pollPage(page, () => /10月27日/.test(document.querySelector(".greet .eyebrow")?.textContent ?? ""));
+    assert.match(await page.locator(".journey h2").textContent(), /新词\s*2/);
+    assert.match(await page.locator(".week .is-today").getAttribute("title"), /^2026-10-27/);
+    assert.equal(await page.locator(".streak-body .ring b").textContent(), "0");
+    const secondWord = await page.locator(".wotd-word").textContent();
+    assert.notEqual(secondWord, firstWord, "The daily word must update with the calendar day.");
+
+    await visibility(page, "hidden");
+    await page.clock.setSystemTime("2026-10-28T12:00:00Z");
+    await visibility(page, "visible");
+    await waitForWriteAccess(page, "writable");
+    await pollPage(page, () => /10月28日/.test(document.querySelector(".greet .eyebrow")?.textContent ?? ""));
+    assert.match(await page.locator(".greet h1").textContent(), /中午好/);
+    await page.getByRole("button", { name: "开始今天的旅程", exact: false }).click();
+    const session = (await storedState(page)).progress.session;
+    assert.deepEqual(session.reviewIds, [target[0]]);
+    assert.equal(session.newIds.length, 2, "Starting a session must use the same day's allowance as the refreshed plan.");
+    assert.equal(session.started, Date.parse("2026-10-28T12:00:00Z"));
+    assert.deepEqual(pageErrors, []);
+    return { dueRefreshedWithoutInput: true, midnightRefreshed: true, visibleResumeRefreshed: true, planAndSessionAgree: true, firstWord, secondWord, pageErrors };
+  } finally {
+    await context.close();
+  }
+}
+
+async function testPracticePool(browser, origin) {
+  let hold = false;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const { context, page, pageErrors } = await createCase(browser, origin, async (route, url) => {
+    if (!hold || !url.pathname.includes("/entries/") || !url.pathname.endsWith(".json")) return false;
+    await gate;
+    await route.continue();
+    return true;
+  }, practiceProgress(index.words.map((row) => row[0])));
+  try {
+    await page.clock.setFixedTime("2026-10-26T10:00:00Z");
+    await openSavedPractice(page, origin);
+    const selected = [];
+    for (let i = 0; i < 10; i++) {
+      await page.locator(".typing-input:not([readonly])").waitFor();
+      const word = await page.locator(".typing-text").textContent();
+      const position = index.words.findIndex((row) => row[1] === word || row[1].split("/")[0] === word);
+      assert.ok(position >= 0, `Practice must use a real indexed word: ${word}`);
+      selected.push(position);
+      await page.locator(".typing-input").fill(word);
+      if (i < 9) await pollPage(page, (step) => document.querySelector(".typing-help")?.textContent?.includes(`第 ${step}/10 项`), i + 2);
+    }
+    await page.locator(".typing-done").getByText("本轮完成", { exact: true }).waitFor();
+    assert.equal(new Set(selected).size, 10);
+    assert.ok(selected.some((position) => position >= 60), "Sampling must reach beyond the old first-sixty limit.");
+    assert.equal((await storedState(page)).progress.typing.length, 1);
+
+    // A later seed chooses uncached real chunks. Returning while they load must
+    // cancel the pending round even though the parent Practice remains mounted.
+    await page.clock.setFixedTime("2026-10-27T10:00:00Z");
+    hold = true;
+    const waiting = page.waitForRequest((request) => new URL(request.url()).pathname.includes("/entries/"));
+    await page.getByRole("button", { name: "再来一轮", exact: false }).click();
+    await waiting;
+    await page.locator(".typing-done").getByRole("button", { name: "返回", exact: true }).click();
+    release();
+    await page.waitForLoadState("networkidle");
+    await page.getByRole("heading", { name: "让手，也记住它们。", exact: true }).waitFor();
+    assert.equal(await page.locator(".typing-input").count(), 0);
+    assert.equal(await page.getByRole("button", { name: "开始一轮", exact: true }).isEnabled(), true);
+    assert.equal((await storedState(page)).progress.typing.length, 1);
+    assert.deepEqual(pageErrors, []);
+    return { selectedPositions: selected, wholeSourceEligible: true, cancelledRestartStayedClosed: true, pageErrors };
+  } finally {
+    release();
+    await context.close();
+  }
+}
+
+async function testPracticeCompletion(browser, origin) {
+  const { context, page, pageErrors } = await createCase(browser, origin, undefined, practiceProgress([target[0], searched[0]]));
+  try {
+    const start = Date.parse("2026-10-26T10:00:00Z");
+    await page.clock.install({ time: start - 60_000 });
+    await openSavedPractice(page, origin);
+    await page.clock.pauseAt(start);
+    let characters = 0;
+    for (let i = 0; i < 2; i++) {
+      const input = page.locator(".typing-input");
+      const word = await page.locator(".typing-text").textContent();
+      characters += Array.from(word).length;
+      await input.fill(word.slice(0, 1));
+      await page.clock.runFor(1000);
+      await input.fill(word);
+      if (i === 0) {
+        assert.equal(await input.evaluate((element) => element.readOnly), true, "Completion must synchronously lock the current item.");
+        await page.keyboard.press("Space");
+        await page.keyboard.press("Space");
+        assert.equal(await input.inputValue(), word, "Extra input during the 260ms transition must be ignored.");
+        await page.clock.runFor(300);
+        await page.locator(".typing-input:not([readonly])").waitFor();
+        assert.equal(await page.locator(".typing-input").inputValue(), "");
+      }
+    }
+    await page.locator(".typing-done").getByText("本轮完成", { exact: true }).waitFor();
+    const rounds = (await storedState(page)).progress.typing;
+    assert.equal(rounds.length, 1);
+    assert.equal(rounds[0].items, 2);
+    assert.equal(rounds[0].accuracy, 100);
+    assert.equal(rounds[0].wpm, Math.round(characters / 5 / (2 / 60)));
+    await page.getByRole("button", { name: "再来一轮", exact: false }).click();
+    await page.locator(".typing-input:not([readonly])").waitFor();
+    assert.equal(await page.locator(".typing-input").inputValue(), "");
+    assert.equal((await storedState(page)).progress.typing.length, 1);
+    assert.deepEqual(pageErrors, []);
+    return { transitionLocked: true, exactlyOneSavedRound: true, accuracy: rounds[0].accuracy, wpm: rounds[0].wpm, pageErrors };
+  } finally {
+    await context.close();
+  }
+}
+
+async function testPracticePause(browser, origin) {
+  const { context, page, pageErrors } = await createCase(browser, origin, undefined, practiceProgress([target[0]]));
+  try {
+    const start = Date.parse("2026-10-26T10:00:00Z");
+    await page.clock.install({ time: start - 60_000 });
+    await openSavedPractice(page, origin);
+    await page.clock.pauseAt(start);
+    const word = await page.locator(".typing-text").textContent();
+    await page.locator(".typing-input").fill(word.slice(0, 2));
+    await page.clock.runFor(500);
+    await visibility(page, "hidden");
+    await waitForWriteAccess(page, "readonly");
+    await page.clock.fastForward(30_000);
+    assert.equal(await page.locator(".typing-input").inputValue(), word.slice(0, 2));
+    await visibility(page, "visible");
+    await waitForWriteAccess(page, "writable");
+    await page.locator(".typing-input:not([readonly])").waitFor();
+    assert.equal(await page.locator(".typing-input").inputValue(), word.slice(0, 2), "Visibility changes must preserve the mounted round's input.");
+    await page.clock.runFor(500);
+    await page.locator(".typing-input").fill(word);
+    await page.locator(".typing-done").getByText("本轮完成", { exact: true }).waitFor();
+    const round = (await storedState(page)).progress.typing[0];
+    assert.equal(round.wpm, Array.from(word).length * 12, "Thirty seconds in the background must not count as typing time.");
+    assert.equal(round.accuracy, 100);
+    assert.deepEqual(pageErrors, []);
+    return { inputPreserved: true, hiddenMsExcluded: 30_000, activeMs: 1000, wpm: round.wpm, pageErrors };
+  } finally {
+    await context.close();
+  }
+}
+
+async function testPracticeSaveRetry(browser, origin) {
+  const { context, page, pageErrors } = await createCase(browser, origin, undefined, practiceProgress([target[0]]));
+  try {
+    await openSavedPractice(page, origin);
+    await page.evaluate((datasetId) => {
+      const original = Storage.prototype.setItem;
+      window.__rejectProgress = true;
+      Storage.prototype.setItem = function (key, value) {
+        if (window.__rejectProgress && this === localStorage && key === `word-atlas:v2:${datasetId}`) throw new DOMException("Test storage full", "QuotaExceededError");
+        return original.call(this, key, value);
+      };
+    }, index.id);
+    await page.locator(".typing-input").fill(await page.locator(".typing-text").textContent());
+    await page.locator(".typing-done").getByText("本轮记录尚未保存", { exact: true }).waitFor();
+    await page.locator(".typing-done [role=alert]").waitFor();
+    const failed = await storedState(page);
+    assert.equal(failed.progress.typing.length, 1, "The unsaved round must remain available for recovery.");
+    assert.equal(JSON.parse(failed.savedProgress).typing.length, 0);
+    assert.equal(await page.locator(".typing-done").getByText("本轮完成", { exact: true }).count(), 0);
+    await page.evaluate(() => { window.__rejectProgress = false; });
+    await page.locator(".typing-done").getByRole("button", { name: "重试保存", exact: true }).click();
+    await page.locator(".typing-done").getByText("本轮完成", { exact: true }).waitFor();
+    const saved = await storedState(page);
+    assert.equal(saved.progress.typing.length, 1, "Retry must flush the existing round, not append another one.");
+    assert.deepEqual(JSON.parse(saved.savedProgress).typing, saved.progress.typing);
+    assert.deepEqual(pageErrors, []);
+    return { failedSaveDidNotComplete: true, retrySavedExactlyOnce: true, pageErrors };
+  } finally {
+    await context.close();
+  }
+}
+
+async function testPracticeVariants(browser, origin) {
+  const cheque = index.words.find((row) => row[1] === "cheque/check");
+  assert.ok(cheque, "The real variant entry must exist.");
+  const { context, page, pageErrors } = await createCase(browser, origin, undefined, practiceProgress([cheque[0]]));
+  try {
+    await openSavedPractice(page, origin);
+    assert.equal(await page.locator(".typing-text").textContent(), "cheque");
+    await page.locator(".typing-input").fill("check");
+    await page.locator(".typing-done").getByText("本轮完成", { exact: true }).waitFor();
+    const rounds = (await storedState(page)).progress.typing;
+    assert.equal(rounds.length, 1);
+    assert.equal(rounds[0].accuracy, 100);
+    assert.deepEqual(pageErrors, []);
+    return { initialTarget: "cheque", accepted: "check", accuracy: 100, pageErrors };
+  } finally {
+    await context.close();
+  }
+}
+
+async function testPracticeFastInput(browser, origin) {
+  const { context, page, pageErrors } = await createCase(browser, origin, undefined, practiceProgress([target[0]]));
+  try {
+    const start = Date.parse("2026-10-26T10:00:00Z");
+    await page.clock.install({ time: start - 60_000 });
+    await openSavedPractice(page, origin, "sentence");
+    await page.clock.pauseAt(start);
+    const text = await page.locator(".typing-text").textContent();
+    assert.ok(text.length > 34, "The real example must be long enough to exercise the stored speed limit.");
+    await page.locator(".typing-input").fill(text.slice(0, 1));
+    await page.clock.runFor(1000);
+    await page.locator(".typing-input").fill(text);
+    await page.locator(".typing-done").getByText("本轮完成", { exact: true }).waitFor();
+    const result = await page.evaluate(async () => {
+      const { store, exportBackup, validateBackup, sanitizeProgress } = await import("/src/store/store.ts");
+      const progress = store.get().progress;
+      const exported = JSON.parse(exportBackup());
+      return { round: progress.typing[0], sanitized: sanitizeProgress(exported.progress, progress.datasetId).typing, backup: validateBackup(exported, progress.datasetId).ok };
+    });
+    assert.equal(result.round.wpm, 400);
+    assert.deepEqual(result.sanitized, [result.round]);
+    assert.equal(result.backup, true);
+    assert.deepEqual(pageErrors, []);
+    return { cappedWpm: 400, persistedRoundAccepted: true, backupRoundTripValid: true, pageErrors };
+  } finally {
+    await context.close();
+  }
+}
+
+async function testSpellVariant(browser, origin, spelling) {
+  const cheque = index.words.find((row) => row[1] === "cheque/check");
+  assert.ok(cheque);
+  const progress = resumedQuiz();
+  progress.session.steps = [{ id: cheque[0], kind: "intro" }, { id: cheque[0], kind: "spell" }];
+  progress.session.newIds = [cheque[0]];
+  const { context, page, pageErrors } = await createCase(browser, origin, undefined, progress);
+  try {
+    await page.goto(`${origin}/#/learn`, { waitUntil: "domcontentloaded" });
+    await page.locator(".spell-input").waitFor();
+    await waitForWriteAccess(page, "writable");
+    assert.equal(await page.locator(".slots .slot").count(), 6);
+    assert.match(await page.locator(".spell-input").getAttribute("aria-label"), /提示词形 6 个字符/);
+    if (spelling === "cheque") {
+      const hint = page.getByRole("button", { name: "提示字母", exact: true });
+      for (let i = 0; i < 5; i++) await hint.click();
+      assert.equal(await hint.isDisabled(), true);
+      assert.equal(await page.locator(".spell-input").inputValue(), "chequ");
+    }
+    await page.locator(".spell-input").fill(spelling);
+    await page.locator(".spell-input").press("Enter");
+    await pollPage(page, async () => !!(await import("/src/store/store.ts")).store.get().progress.session?.pending);
+    const state = await learningState(page);
+    assert.equal(state.pending.correct, true);
+    assert.equal(state.pending.value, spelling);
+    assert.equal(await page.locator(".slots .slot").count(), spelling.length);
+    assert.equal(await page.locator(".slots .slot.is-bad").count(), 0);
+    assert.equal(await page.locator(".spell-input").inputValue(), spelling);
+    assert.deepEqual(pageErrors, []);
+    return { spelling, initialSlots: 6, correctSlots: spelling.length, accepted: true, hintsLimitedToPreferredForm: spelling === "cheque", pageErrors };
+  } finally {
+    await context.close();
+  }
+}
+
+async function testPictureSo(browser, origin) {
+  const so = index.words.find((row) => row[1] === "so");
+  assert.ok(so);
+  const progress = resumedQuiz();
+  progress.session.steps = [{ id: so[0], kind: "intro" }, { id: so[0], kind: "picture", options: [so[0], ...index.words.slice(0, 3).map((row) => row[0])] }];
+  progress.session.newIds = [so[0]];
+  const { context, page, pageErrors } = await createCase(browser, origin, undefined, progress);
+  try {
+    await page.goto(`${origin}/#/learn`, { waitUntil: "domcontentloaded" });
+    await page.locator(".quiz-picture .cloze .blank").waitFor();
+    const cloze = await page.locator(".quiz-picture .cloze").textContent();
+    assert.match(cloze, /^The soup was\s+hot that I had to wait\.$/);
+    assert.deepEqual(pageErrors, []);
+    return { headword: "so", unrelatedSoupPreserved: true, cloze, pageErrors };
   } finally {
     await context.close();
   }

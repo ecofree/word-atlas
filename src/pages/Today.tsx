@@ -4,7 +4,8 @@ import { prefetch, useAtlas, useEntry } from "../atlas/context";
 import { go, openWord } from "../lib/router";
 import { cue } from "../lib/sound";
 import { hashSeed } from "../lib/text";
-import { buildSession, masteredCount, todayPlan } from "../store/session";
+import { useTodayNow } from "../lib/today-clock";
+import { buildSession, masteredCount, newToday, todayPlan } from "../store/session";
 import { isMastered } from "../store/srs";
 import { dayKey, store, useStore } from "../store/store";
 import { Galaxy } from "../galaxy/Galaxy";
@@ -22,9 +23,9 @@ function greeting(h: number) {
   return "晚上好";
 }
 
-export function streakOf(days: Record<string, { r: number }>) {
+export function streakOf(days: Record<string, { r: number }>, now = Date.now()) {
   let n = 0;
-  const d = new Date();
+  const d = new Date(now);
   if (!(days[dayKey(d)]?.r > 0)) d.setDate(d.getDate() - 1);
   while (days[dayKey(d)]?.r > 0) {
     n++;
@@ -37,7 +38,10 @@ export function Today() {
   const atlas = useAtlas();
   const progress = useStore((s) => s.progress);
   const settings = useStore((s) => s.settings);
-  const plan = useMemo(() => todayPlan(atlas, progress, settings), [atlas, progress, settings]);
+  const time = useTodayNow(progress.cards);
+  const now = new Date(time);
+  const dateKey = dayKey(now);
+  const plan = useMemo(() => todayPlan(atlas, progress, settings, time), [atlas, progress, settings, time]);
   // Warm the first cards of today's journey so the session opens instantly.
   const firstIds = [...plan.due.slice(0, 4), ...plan.fresh.slice(0, 6)].join(",");
   useEffect(() => {
@@ -45,26 +49,28 @@ export function Today() {
     const t = window.setTimeout(() => void prefetch(atlas, ids), 800);
     return () => window.clearTimeout(t);
   }, [atlas, firstIds]);
-  const now = new Date();
-  const today = progress.days[dayKey()];
-  const streak = streakOf(progress.days);
+  const today = progress.days[dateKey];
+  const streak = streakOf(progress.days, time);
   const active = progress.session && !progress.session.finished ? progress.session : null;
   const total = plan.due.length + plan.fresh.length;
   const goal = settings.dailyNew + Math.min(plan.due.length, 60);
   const doneToday = today?.r ?? 0;
 
   const start = (opts?: { reviewOnly?: boolean; extra?: number }) => {
-    if (!active) {
-      const s = buildSession(atlas, progress, opts?.extra ? { ...settings, dailyNew: (today?.n ?? 0) + opts.extra } : settings, { reviewOnly: opts?.reviewOnly });
+    const { progress: latest, settings: currentSettings, writeAccess } = store.get();
+    if (writeAccess !== "writable") return;
+    if (!latest.session || latest.session.finished) {
+      const started = Date.now();
+      const s = buildSession(atlas, latest, opts?.extra ? { ...currentSettings, dailyNew: newToday(latest, started) + opts.extra } : currentSettings, { reviewOnly: opts?.reviewOnly }, started);
       if (!s.steps.length) return;
-      store.progress((p) => ({ ...p, session: s }));
+      if (!store.progress((p) => ({ ...p, session: s }))) return;
     }
     if (settings.sfx) void cue("start");
     go({ page: "learn" });
   };
 
   const week = Array.from({ length: 7 }, (_, i) => {
-    const d = new Date();
+    const d = new Date(time);
     d.setDate(d.getDate() - (6 - i));
     const k = dayKey(d);
     return { k, label: "日一二三四五六"[d.getDay()], v: progress.days[k]?.r ?? 0, today: i === 6 };
@@ -152,7 +158,7 @@ export function Today() {
       </section>
 
       <div className="today-grid">
-        <WordOfDay />
+        <WordOfDay dateKey={dateKey} />
 
         <section className="panel streak-panel">
           <div className="panel-head">
@@ -192,24 +198,23 @@ export function Today() {
         </section>
 
         <LevelPath />
-        <GalaxyPanel learned={learned} total={atlas.count} />
+        <GalaxyPanel learned={learned} total={atlas.count} now={time} />
         <Topics />
       </div>
     </div>
   );
 }
 
-function GalaxyPanel({ learned, total }: { learned: number; total: number }) {
-  const today = useStore((s) => s.progress.days[dayKey()]);
+function GalaxyPanel({ learned, total, now }: { learned: number; total: number; now: number }) {
   const ids = useStore((s) => s.progress.cards);
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  const todayStart = start.getTime();
   const todayIds = useMemo(() => {
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
     return Object.entries(ids)
-      .filter(([, c]) => c.seen >= start.getTime())
+      .filter(([, c]) => c.seen >= todayStart)
       .map(([id]) => id);
-  }, [ids]);
-  void today;
+  }, [ids, todayStart]);
   return (
     <section className="galaxy-panel" onClick={() => go({ page: "atlas", view: "galaxy" })} role="link" tabIndex={0} onKeyDown={(e) => e.key === "Enter" && go({ page: "atlas", view: "galaxy" })}>
       <Galaxy mode="mini" highlight={todayIds} />
@@ -227,13 +232,13 @@ function GalaxyPanel({ learned, total }: { learned: number; total: number }) {
   );
 }
 
-function WordOfDay() {
+function WordOfDay({ dateKey }: { dateKey: string }) {
   const atlas = useAtlas();
   const pick = useMemo(() => {
     const pool = atlas.words.filter((w) => w.cefr >= 2 && w.media & 1);
     const list = pool.length ? pool : atlas.words;
-    return list[hashSeed(dayKey()) % list.length];
-  }, [atlas]);
+    return list[hashSeed(dateKey) % list.length];
+  }, [atlas, dateKey]);
   const { entry } = useEntry(pick?.id);
   if (!pick) return null;
   return (

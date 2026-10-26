@@ -91,6 +91,7 @@ export default function App() {
 }
 
 function Shell({ privateAvailable }: { privateAvailable: boolean }) {
+  const datasetId = useAtlas().id;
   const { route, word } = useLocation();
   const onboarded = useStore((s) => s.settings.onboarded);
   const theme = useStore((s) => s.settings.theme);
@@ -166,7 +167,7 @@ function Shell({ privateAvailable }: { privateAvailable: boolean }) {
         {route.page === "today" && <Today />}
         {route.page === "atlas" && <AtlasPage route={route} />}
         {(route.page === "learn" || route.page === "practice") && (
-          <div className="learning-surface" inert={writeAccess !== "writable"} aria-disabled={writeAccess !== "writable"}>
+          <div key={datasetId} className="learning-surface" inert={writeAccess !== "writable"} aria-disabled={writeAccess !== "writable"}>
             {route.page === "learn" && <Learn />}
             {route.page === "practice" && <Practice />}
           </div>

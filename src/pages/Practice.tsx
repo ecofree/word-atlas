@@ -1,12 +1,13 @@
 import { Headphones, Keyboard, RotateCcw, Type } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { prefetch, useAtlas } from "../atlas/context";
 import type { Entry } from "../atlas/types";
 import { play, stopAudio } from "../lib/audio";
 import { cue } from "../lib/sound";
-import { hashSeed, shuffle } from "../lib/text";
-import { clean, correctCharacterCount, same, typingDelta, typingMetrics } from "../lib/typing";
-import { store, useStore } from "../store/store";
+import { acceptedForms, acceptsAnswer, hashSeed, preferredForm } from "../lib/text";
+import { practiceTarget, samplePracticeIds, TypingRun } from "../lib/practice";
+import { same, typingMetrics } from "../lib/typing";
+import { flush, store, useStore, type TypingRound as SavedTypingRound } from "../store/store";
 import { AmbiencePicker } from "../ui/Ambience";
 import { Illustration } from "../ui/Illustration";
 
@@ -31,7 +32,12 @@ export function Practice() {
   const startLevel = useStore((s) => s.settings.startLevel);
   const [mode, setMode] = useState<Mode>("word");
   const [source, setSource] = useState<Source>(() => (Object.keys(progress.cards).length ? "recent" : "path"));
-  const [round, setRound] = useState<{ entries: Entry[]; key: number } | null>(null);
+  const [round, setRound] = useState<{ entries: Entry[]; key: number; mode: Mode } | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
+  const request = useRef(0);
+  const loading = useRef(false);
+  useEffect(() => () => { request.current++; }, []);
 
   const pool = useMemo(() => {
     const learned = Object.entries(progress.cards)
@@ -43,12 +49,29 @@ export function Practice() {
   }, [atlas, progress.cards, progress.mistakes, progress.bookmarks, source, startLevel]);
 
   const start = async () => {
-    const ids = shuffle(pool.slice(0, 60), hashSeed(String(Date.now()))).slice(0, 10);
+    if (loading.current || store.get().writeAccess !== "writable") return;
+    const key = ++request.current;
+    loading.current = true;
+    setStarting(true);
+    setStartError(null);
+    const ids = samplePracticeIds(pool, hashSeed(String(Date.now())));
     const entries = (await prefetch(atlas, ids)).filter((e): e is Entry => !!e && (mode === "word" || e.ex.length > 0));
-    if (entries.length) setRound({ entries, key: Date.now() });
+    if (request.current !== key) return;
+    loading.current = false;
+    setStarting(false);
+    if (entries.length) setRound({ entries, key, mode });
+    else setStartError("这轮词条暂时加载不了，请检查网络后重试。");
   };
 
-  if (round) return <TypingRound key={round.key} mode={mode} entries={round.entries} onExit={() => setRound(null)} onAgain={start} />;
+  const cancelRound = () => {
+    request.current++;
+    loading.current = false;
+    setStarting(false);
+    setStartError(null);
+    setRound(null);
+  };
+
+  if (round) return <TypingRound key={round.key} mode={round.mode} entries={round.entries} onExit={cancelRound} onAgain={start} restarting={starting} startError={startError} />;
 
   const best = progress.typing.filter((t) => t.mode === mode).reduce((m, t) => Math.max(m, t.wpm), 0);
   return (
@@ -63,7 +86,7 @@ export function Practice() {
           <h3 className="eyebrow">模式</h3>
           <div className="mode-cards">
             {MODES.map(([k, name, desc, Icon]) => (
-              <button key={k} className={`mode-card ${mode === k ? "is-on" : ""}`} onClick={() => setMode(k)} aria-pressed={mode === k}>
+              <button key={k} className={`mode-card ${mode === k ? "is-on" : ""}`} onClick={() => setMode(k)} aria-pressed={mode === k} disabled={starting}>
                 <Icon size={22} strokeWidth={1.7} />
                 <b>{name}</b>
                 <small>{desc}</small>
@@ -73,7 +96,7 @@ export function Practice() {
           <h3 className="eyebrow">词来自</h3>
           <div className="segmented segmented-wide">
             {SOURCES.map(([k, label]) => (
-              <button key={k} className={source === k ? "is-on" : ""} onClick={() => setSource(k)} aria-pressed={source === k}>
+              <button key={k} className={source === k ? "is-on" : ""} onClick={() => setSource(k)} aria-pressed={source === k} disabled={starting}>
                 {label}
               </button>
             ))}
@@ -85,8 +108,9 @@ export function Practice() {
                 : `可练 ${pool.length} 个词，每轮随机 10 个。`
               : "这里还没有词，先去学几个，或换个来源。"}
           </p>
-          <button className="btn btn-primary btn-xl" onClick={start} disabled={!pool.length}>
-            开始一轮
+          {startError && <p role="alert">{startError}</p>}
+          <button className="btn btn-primary btn-xl" onClick={start} disabled={!pool.length || starting}>
+            {starting ? "正在准备…" : "开始一轮"}
           </button>
         </section>
         <section className="panel practice-side">
@@ -111,76 +135,121 @@ export function Practice() {
   );
 }
 
-function TypingRound({ mode, entries, onExit, onAgain }: { mode: Mode; entries: Entry[]; onExit: () => void; onAgain: () => void }) {
+function TypingRound({ mode, entries, onExit, onAgain, restarting, startError }: { mode: Mode; entries: Entry[]; onExit: () => void; onAgain: () => void; restarting: boolean; startError: string | null }) {
   const atlas = useAtlas();
   const settings = useStore((s) => s.settings);
-  const [i, setI] = useState(0);
-  const [value, setValue] = useState("");
-  // Running totals live in a ref so every keystroke is counted exactly once.
-  const totalsRef = useRef({ typed: 0, correct: 0, accepted: 0, ms: 0 });
-  const [totals, setTotals] = useState(totalsRef.current);
-  const [done, setDone] = useState(false);
-  const started = useRef<number | null>(null);
+  const [run] = useState(() => new TypingRun(entries.length));
+  const [state, setState] = useState(() => run.snapshot());
+  const { index: i, value, phase, active, totals } = state;
+  const refresh = useCallback(() => setState(run.snapshot()), [run]);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const record = useRef<SavedTypingRound | null>(null);
+  const recorded = useRef(false);
+  const attemptedSave = useRef(false);
   const input = useRef<HTMLInputElement>(null);
   const e = entries[i];
-  const target = mode === "word" ? e.w : e.ex[0].en;
+  const forms = mode === "word" ? acceptedForms(e.w) : [e.ex[0].en];
+  const target = mode === "word" ? practiceTarget(forms, value) || preferredForm(e.w) : e.ex[0].en;
 
   useEffect(() => {
-    setValue("");
-    started.current = null;
+    const update = () => {
+      run.setActive(document.visibilityState !== "hidden" && store.get().writeAccess === "writable", performance.now());
+      refresh();
+    };
+    const unsubscribe = store.subscribe(update);
+    document.addEventListener("visibilitychange", update);
+    update();
+    return () => {
+      unsubscribe();
+      document.removeEventListener("visibilitychange", update);
+      run.setActive(false, performance.now());
+    };
+  }, [run, refresh]);
+
+  useEffect(() => {
+    if (!active || phase !== "typing") { stopAudio(); return; }
     input.current?.focus();
     if (mode === "dictation") void play(atlas.audio(e, "ex"), e.ex[0].en, settings.accent);
     if (mode === "word" && settings.autoplay) void play(atlas.audio(e, settings.accent), e.w, settings.accent);
-  }, [i]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [i, active, phase]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => () => stopAudio(), []);
 
-  const onChange = (next: string) => {
-    if (done) return;
-    if (started.current === null && next) started.current = performance.now();
-    const d = typingDelta(value, next, target);
-    if (settings.sfx && d.total > 0) void cue("key");
-    const t = totalsRef.current;
-    totalsRef.current = { ...t, typed: t.typed + d.total, correct: t.correct + d.correct };
-    setTotals(totalsRef.current);
-    setValue(next);
-    if (clean(next).length >= clean(target).length && same(next.trimEnd(), target)) finishItem(next);
-  };
+  useEffect(() => {
+    if (phase !== "transition" || !active) return;
+    const timer = window.setTimeout(() => { if (run.advance()) refresh(); }, 260);
+    return () => window.clearTimeout(timer);
+  }, [run, refresh, i, phase, active]);
 
-  const finishItem = (final: string) => {
-    const ms = started.current ? performance.now() - started.current : 0;
-    const accepted = correctCharacterCount(final, target);
-    if (settings.sfx) void cue("correct");
-    const t = totalsRef.current;
-    const nt = { ...t, accepted: t.accepted + accepted, ms: t.ms + ms };
-    totalsRef.current = nt;
-    setTotals(nt);
-    if (i + 1 >= entries.length) {
-      setDone(true);
-      const m = typingMetrics(nt.correct, nt.typed, nt.accepted, nt.ms);
-      store.progress((p) => ({ ...p, typing: [...p.typing, { at: Date.now(), mode, items: entries.length, wpm: m.wpm, accuracy: m.accuracy }].slice(-500) }));
-    } else window.setTimeout(() => setI(i + 1), 260);
+  const saveResult = useCallback(() => {
+    if (run.snapshot().phase !== "saving") return;
+    attemptedSave.current = true;
+    if (store.get().writeAccess !== "writable" || document.visibilityState === "hidden") {
+      setSaveError("请回到拥有编辑权限的窗口后重试保存，本轮输入会保留。");
+      return;
+    }
+    if (!record.current) {
+      const t = run.snapshot().totals;
+      const m = typingMetrics(t.correct, t.typed, t.accepted, t.ms);
+      record.current = { at: Date.now(), mode, items: entries.length, wpm: m.wpm, accuracy: m.accuracy };
+    }
+    if (!recorded.current) {
+      const saved = record.current;
+      if (!store.progress((p) => ({ ...p, typing: [...p.typing, saved].slice(-500) }))) {
+        setSaveError("暂时不能保存本轮记录，请恢复编辑权限后重试。");
+        return;
+      }
+      recorded.current = true;
+    }
+    // An accepted mutation can still be dirty when localStorage is full. A retry
+    // flushes that same record instead of appending the completed round again.
+    if (!flush() || store.get().saveError) {
+      setSaveError("浏览器还没有保存这轮记录。请重试保存，或到「我的」导出备份。");
+      return;
+    }
+    run.saved();
+    setSaveError(null);
+    refresh();
+  }, [run, refresh, mode, entries.length]);
+
+  useEffect(() => {
+    if (phase === "saving" && active && !attemptedSave.current) saveResult();
+  }, [phase, active, saveResult]);
+
+  const onChange = (next: string) => {
+    if (store.get().writeAccess !== "writable" || document.visibilityState === "hidden") return;
+    const expected = mode === "word" ? practiceTarget(forms, next) : target;
+    const complete = mode === "word" ? acceptsAnswer(next, e.w) : same(next.trimEnd(), target);
+    const result = run.change(next, expected, complete, performance.now());
+    if (!result) return;
+    if (settings.sfx && result.inserted > 0) void cue("key");
+    if (settings.sfx && result.completed) void cue("correct");
+    refresh();
   };
 
   const m = typingMetrics(totals.correct, totals.typed, totals.accepted, totals.ms);
   const chars = Array.from(target);
   const typed = Array.from(value);
 
-  if (done)
+  if (phase === "done" || phase === "saving")
     return (
       <div className="page practice">
         <section className="panel typing-done">
-          <p className="eyebrow">本轮完成</p>
+          <p className="eyebrow">{phase === "done" ? "本轮完成" : "本轮记录尚未保存"}</p>
           <h1 className="display">
             {m.wpm} <small>WPM</small>
           </h1>
           <p className="lede">准确率 {m.accuracy}% · {entries.length} 项</p>
+          {saveError && <p role="alert">{saveError}</p>}
+          {startError && <p role="alert">{startError}</p>}
           <div className="summary-actions">
             <button className="btn btn-ghost" onClick={onExit}>
               返回
             </button>
-            <button className="btn btn-primary btn-xl" onClick={onAgain} autoFocus>
-              <RotateCcw size={18} /> 再来一轮
-            </button>
+            {phase === "done" ? (
+              <button className="btn btn-primary btn-xl" onClick={onAgain} autoFocus disabled={restarting}>
+                <RotateCcw size={18} /> {restarting ? "正在准备…" : "再来一轮"}
+              </button>
+            ) : <button className="btn btn-primary btn-xl" onClick={saveResult} disabled={!active}>重试保存</button>}
           </div>
         </section>
       </div>
@@ -235,6 +304,7 @@ function TypingRound({ mode, entries, onExit, onAgain }: { mode: Mode; entries: 
           ref={input}
           className="typing-input"
           value={value}
+          readOnly={phase !== "typing" || !active}
           onChange={(ev) => onChange(ev.target.value)}
           autoFocus
           autoCapitalize="off"

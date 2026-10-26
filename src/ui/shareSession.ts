@@ -27,8 +27,8 @@ export async function shareSession(atlas: Atlas, s: ActiveSession) {
     await document.fonts.load(`600 96px ${SERIF}`).catch(() => null);
     ctx.fillStyle = "#F3ECDF";
     ctx.fillRect(0, 0, W, H);
-    const ids = [...new Set(s.steps.map((x) => x.id))].slice(0, 9);
-    const refs = ids.map((id) => atlas.byId.get(id)!).filter(Boolean);
+    const allRefs = [...new Set(s.steps.map((x) => x.id))].map((id) => atlas.byId.get(id)!).filter(Boolean);
+    const refs = allRefs.slice(0, 9);
     const pad = 64;
     const gapPx = 16;
     const cell = (W - pad * 2 - gapPx * 2) / 3;
@@ -59,10 +59,10 @@ export async function shareSession(atlas: Atlas, s: ActiveSession) {
     const d = new Date();
     ctx.fillStyle = "#8A8C96";
     ctx.font = `500 28px ${SANS}`;
-    ctx.fillText(`${d.getMonth() + 1}月${d.getDate()}日 · 今天点亮了 ${ids.length} 颗星`, pad, top - 24);
+    ctx.fillText(`${d.getMonth() + 1}月${d.getDate()}日 · 今天点亮了 ${allRefs.length} 颗星`, pad, top - 24);
     ctx.fillStyle = "#1E2640";
     ctx.font = `600 64px ${SERIF}`;
-    ctx.fillText(`学了 ${ids.length} 个词，首次正确 ${st.accuracy}%`, pad, top + 52, W - pad * 2);
+    ctx.fillText(`学了 ${allRefs.length} 个词，首次正确 ${st.accuracy}%`, pad, top + 52, W - pad * 2);
     const wrong = Object.values(s.graded).filter((g) => g === Rating.Again).length;
     ctx.font = `400 30px ${SANS}`;
     ctx.fillStyle = "#5A6075";
